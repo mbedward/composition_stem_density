@@ -1,0 +1,1682 @@
+---
+title: "Preferred model of composition versus stem density and flood history"
+author: "Michael Bedward (mbedward@uow.edu.au)"
+date: "24/07/2020"
+output: html_document
+---
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+
+library(rjags)
+library(R2jags)
+
+library(boral)
+#library(ggboral)
+
+library(dplyr)
+library(ggplot2)
+library(latex2exp)
+library(readxl)
+library(stringr)
+library(tidyr)
+
+# local package
+data(SITES, package = "RRGcommon")
+
+# Random number seed
+set.seed(42)
+
+# Set this to TRUE to force re-fitting of models if
+# cached objects exist. Set to FALSE to use cached outputs.
+REFIT_MODELS <- FALSE
+
+# Set this to TRUE to save graphs to file with the gg_pdf function (below).
+SAVE_GRAPHS <- TRUE
+
+# Default theme for graphs
+theme_set( theme_bw() + theme(panel.grid = element_blank()))
+
+
+# Load common functions
+source(file = here("scripts", "common_functions.R"))
+
+# Size class look-up table
+data(SIZES, package = "RRGcommon")
+
+```
+
+
+## Summary
+
+This document contains code to run the preferred BORAL-derived model of species composition versus stem density and flood history. This is a slight variant of model 3A in the associated markdown document `models_integrated_stems_species.Rmd`. The purpose of this separate document is just to make the code, text and outputs easier to navigate.
+
+
+## Model description
+
+The model presented here relates understorey species composition to flood history and tree stem density. With earlier models fixed values for mean stem density per plot, based on estimates derived by Bayesian bootstrap, were provided as input data. Here, we instead provide observed sub-plot tree counts and have the model estimate mean stem density and probability of occurrence for species simultaneously.
+
+The motivation for an integrated model is to account for within-plot variability in stem density. Estimating mean density per tree size class at each model iteration means that we are relating species probabilities of occurrence within a given plot to a *distribution* of mean stem density values, where the shape of the distribution reflects the variability over the 0.1ha sub-plot counts for the plot.
+
+To represent flood history, each 9ha plot has been assigned to one of three groups derived from a hierarchical classification of flood occurrence data from Landsat mapping.
+
+Because of the simultaneous MCMC sampling of both stem density means and species occurrence probabilities, information can flow in both directions between the two sub-models. In other words, the model's estimate of mean stem density for a particular tree size class and plot can be influenced by the patterns between species occurrence and that stem densities within that size class over all plots. Thus, inferences about the effects of tree density on understorey species are based on an integrated and consistent use of the available data.
+
+In earlier models we used stochastic search variable selection (SSVS), implemented in BORAL as 'spike and slab' prior distributions, to allow the model to select a subset of tree size classes when modelling each individual understorey species. We then visualized the modelled effects of stem density on species occurrence using heatmap-style graphs of size class inclusion rates for each species. In the model presented here, we replace SSVS with Laplace (double exponential) prior distributions for species coefficients on size class densities. These priors provide 'adaptive shrinkage' (O'Hara and Sillanpää, 2009) of coefficient estimates towards zero, i.e. the data have to indicate a substantial effect for the coefficient value to move from zero than would be the case with Normal priors. The Laplace priors thus serve a similar variable selection role to SSVS priors, but require less work in the MCMC sampling process and provide values that can be directly displayed in a heat-map style graph.
+
+
+## Data
+
+Response data is a matrix of species occurrences within 9ha experimental plots. The data for each plot are formed by pooling records from the three floristics quadrats located within the plot.
+
+```{r}
+
+DAT.occurrence.long <- load_from( here("data", "site_species_boral.RData") ) %>%
+  
+  mutate(siteplot = paste0(site, "-", plot9ha)) %>%
+  
+  distinct(site, plot9ha, siteplot, workingcode)
+
+```
+
+
+Coding, name and habitat information for species.
+
+```{r}
+
+SPECIES.info <- load_from( here("data", "species_info_boral.RData") )
+
+```
+
+
+Summary of species prevalence in sites, plots and quadrats.
+
+```{r}
+
+SPECIES.summary <- load_from( here("data", "species_summary_boral.RData") )
+
+```
+
+
+Flood history plot groupings.
+
+```{r}
+
+DAT.floodgroup <- load_from( here("data", "flood_group_boral.RData") )
+
+```
+
+
+### Identify a subset of species for modelling
+
+Of the 200 species identified as candidates for modelling, 84 were only recorded in 1 or 2 experimental plots (most of the latter being in a single site). 
+
+The threshold number of occurrences set to include a species for modelling is hard to define, but given the complexity of the models to be fitted, a minimum of 5 plot occurrences is a reasonable starting point.
+
+We also remove Eucalpytus camaldulensis (present in all sites) from the data set.
+
+```{r}
+
+SpeciesSubset <- SPECIES.summary %>%
+  dplyr::filter(nplots >= 5) %>%
+  
+  left_join(SPECIES.info, by = c("workingcode", "workingname")) %>%
+  
+  # remove red gums
+  dplyr::filter(workingname != "Eucalyptus camaldulensis")
+
+cat("Subset with", nrow(SpeciesSubset), "taxa", 
+    "of which", sum(SpeciesSubset$weed), "are exotic \n")
+
+```
+
+### Species occurrence data matrix for modelling
+
+```{r}
+
+DAT.occurrence.subset <- DAT.occurrence.long %>%
+  dplyr::filter(workingcode %in% SpeciesSubset$workingcode)
+
+# Format response data as a matrix for boral
+M.y <- DAT.occurrence.subset %>%
+  mutate(present = 1) %>%
+  
+  tidyr::pivot_wider(names_from = workingcode, 
+                     values_from = present, values_fill = 0) %>%
+
+  # Order should be fine but just in case...
+  arrange(site, plot9ha)
+
+
+SiteLookup <- M.y %>%
+  dplyr::select(site, plot = plot9ha, siteplot) %>%
+  left_join(
+    SITES %>% dplyr::select(site, plot, site.quality),
+    by = c("site", "plot")
+  ) %>%
+  
+  left_join(DAT.floodgroup, by = c("site", "plot", "siteplot"))
+
+
+M.y <- as.matrix(M.y[ , -(1:3)])
+rownames(M.y) <- SiteLookup$siteplot
+
+```
+
+
+### Tree stem density data
+
+```{r}
+
+# Stem data
+stems.dir <- here::here("..", "red_gum_thinning", "stem_densities")
+path <- file.path(stems.dir, "data", "stems_complete.RData")
+
+DAT.stems.observed <- load_from(path) %>%
+  # Subset to control and pre-thinning plot data
+  dplyr::filter(survey %in% c("control", "pre.thinning")) %>%
+  
+  arrange(site, plot, subplot) %>%
+  
+  dplyr::select(site, plot, !!(SIZES$sizeclass)) %>%
+  
+  tidyr::pivot_longer(-c(site, plot), names_to = "sizeclass", values_to = "nstems") %>%
+
+  dplyr::filter(!is.na(nstems)) %>%
+  
+  mutate(plotindex = 3*(site-1) + plot,
+         sz = match(sizeclass, SIZES$sizeclass)) %>%
+  
+  dplyr::select(plot = plotindex, sz, nstems)
+
+```
+
+
+## Model
+
+### JAGS model code
+
+The code is based on the BORAL-generated JAGS code for model 3 combined with the JAGS code for the stem count sub-model (see `model_subplot_stems_JAGS.Rmd`). It is a slight variation of model3A (see `models_integrated_stems_species.Rmd`), the differences being:
+
+  * Now has a nested random effect structure for plot within site rather than the previous plot random effect.
+  
+  * Uniform priors on standard deviation parameters have been replaced by exponential priors.
+
+```{r}
+
+model.code <- "model {
+  # Model mean stem count by size class within each plot
+  # Counts are treated as negative binomial - implemented as
+  # Poisson with Gamma-distributed mean
+  for (i in 1:length(nstems)) {
+    nstems[i] ~ dpois(mu.stems[stemplot[i], sz[i]] * h[i])
+    h[i] ~ dgamma(theta[sz[i]], theta[sz[i]])
+  }
+
+  # Priors for stem count model
+  for (sz in 1:11) {
+    # Estimate dispersion independently for each size class
+    theta[sz] ~ dexp(1)
+
+    # Overall mean stems (log scale) for each size class
+    logmu.size[sz] ~ dnorm(0, 5)
+
+    sd.size[sz] ~ dexp(1)
+    tau.size[sz] <- pow(sd.size[sz], -2)
+    
+    for (i in 1:66) {
+      logmu.stems[i, sz] ~ dnorm(logmu.size[sz], tau.size[sz])
+      mu.stems[i, sz] <- exp(logmu.stems[i, sz])
+    }
+  }
+  
+  # Aggregate modelled stem counts for field size classes into
+  # the broader size classes to which species will be related
+  for (i in 1:nplots) {
+    for (k in 1:nsizeclasses) {
+      # MinSize and MaxSize are the start and end indices of field
+      # size classes for each aggregated size class
+      X.stems[i, k] <- sum(mu.stems[i, (MinSize[k]):(MaxSize[k])])
+    }
+  }
+  
+  # Model species occurrence
+  for(i in 1:nplots) {
+    for(j in 1:nspecies) { 
+      eta[i,j] <- inprod(lv.coefs[j,2:(num.lv+1)],lvs[i,]) + 
+        siteplot.effect[i] + 
+        flood.coefs[j, floodgroup[i]] +
+        inprod(stem.coefs[j,], X.stems[i,])
+    
+      Z[i,j] ~ dnorm(lv.coefs[j,1] + eta[i,j], 1)
+      y[i,j] ~ dbern(step(Z[i,j]))
+
+      loglik[(i-1)*(nspecies)+j] <- y[i,j] * log(phi(lv.coefs[j,1] + eta[i,j])) + 
+                                 (1 - y[i,j])*log(1 - phi(lv.coefs[j,1] + eta[i,j]))
+    }
+  }
+  
+  ## Latent variables ##
+  for(i in 1:nplots) { for(k in 1:num.lv) { lvs[i,k] ~ dnorm(0,1) } } 
+  
+  ## Process level and priors ##
+  for(j in 1:nspecies) { lv.coefs[j,1] ~ dnorm(0,0.1) } ## Separate species intercepts
+  
+  
+  ## Nested site-plot random effect
+  for(i in 1:nplots) { 
+    siteplot.effect[i] ~ dnorm(site.effect[site[i]], pow(siteplot.sigma, -2)) 
+  }
+  for (i in 1:nsites) {
+    site.effect[i] ~ dnorm(0, pow(site.sigma, -2))
+  }
+  site.sigma ~ dexp(1)
+  siteplot.sigma ~ dexp(2) # Weakly constrain site-plot sigma relative to site sigma
+  
+  
+  ## Constraints on latent variables for rotation invariance
+  ## (based on scheme used in BORAL)
+  for(i in 1:(num.lv-1)) { 
+    for(j in (i+2):(num.lv+1)) {
+      # Constraints to 0 on upper diagonal
+      lv.coefs[i,j] <- 0 
+    } 
+  }
+  
+  for(i in 1:num.lv) { 
+     # Sign constraints on diagonal elements
+    lv.coefs[i,i+1] ~ dnorm(0,0.1)I(0,) 
+  }
+  
+  for(i in 2:num.lv) { 
+    for(j in 2:i) { 
+      # Free lower diagonals
+      lv.coefs[i,j] ~ dnorm(0,0.1) 
+    } 
+  }
+  
+  for(i in (num.lv+1):nspecies) { 
+    for(j in 2:(num.lv+1)) { 
+      # All other elements
+      lv.coefs[i,j] ~ dnorm(0,0.1)
+    } 
+  }
+  
+  # species coefficients on flood group and stem density
+  # drawn from Laplace priors with variance equal to that of 
+  # the boral default priors (10).
+
+  laplace.scale <- sqrt(2 / 10)
+  for(j in 1:nspecies) { 
+    # coefficient on flood group
+    for (kflood in 1:3) {
+      flood.coefs[j, kflood] ~ ddexp(0, laplace.scale) 
+    }
+
+    for (ksize in 1:nsizeclasses) {
+      stem.coefs[j,ksize] ~ ddexp(0, laplace.scale)
+    }
+  }
+}"
+
+```
+
+
+### Format data for the model
+
+```{r}
+
+# Aggregated size classes for modelling
+
+SizeClasses <- c("less10cm", "from10to20cm", "from20to30cm",
+                 "from30to40cm", "from40to80cm", "from80cm")
+
+FieldToModelSizeClass <- list(
+  1, 2, 3, 4, 5:8, 9:11
+)
+
+# JAGS will not work with the lookup list FieldToModelSizeClass
+# directly, so we create vector versions
+MinSize <- sapply(FieldToModelSizeClass, min)
+MaxSize <- sapply(FieldToModelSizeClass, max)
+
+model.data <- list(
+  y = M.y,
+  floodgroup = as.integer(SiteLookup$floodgroup),
+  nsites = max(SiteLookup$site),
+  nplots = nrow(M.y),
+  nspecies = ncol(M.y),
+  
+  # site index for each floristic plot
+  site = SiteLookup$site,
+  
+  num.lv = 2,
+  
+  # stem counts
+  stemplot = DAT.stems.observed$plot,
+  sz = DAT.stems.observed$sz,
+  nstems = DAT.stems.observed$nstems,
+  nsizeclasses = length(SizeClasses),
+  MinSize = MinSize,
+  MaxSize = MaxSize
+)
+
+```
+
+
+### Compile and run the model
+
+```{r}
+
+# Function to generate initial values for Z: matrix of probit values.
+# Takes the matrix of sites x species occurrences as an argument.
+#
+fn_Zinit <- function(y) {
+  nc <- ncol(y)
+  nr <- nrow(y)
+  
+  Tau <- rWishart(1, nc + 1, diag(nc))[, , 1]
+  Sigma <- solve(Tau)
+
+  Z <- abs(t(mvtnorm::rmvnorm(nr, rep(0, nc), Sigma)))
+  Z <- ifelse(as.matrix(y), Z, -1 * Z)
+  
+  Z
+}
+
+
+ModelPath <- here::here("models", "fitted", "model_chosen_mcmc.RData")
+
+if (REFIT_MODELS || !file.exists(ModelPath)) {
+  modelfit <- R2jags::jags(
+    data = model.data, 
+    inits = list(list(Z = fn_Zinit(M.y))), 
+    parameters.to.save = c("flood.coefs",
+                           "loglik",
+                           "lvs", "lv.coefs", 
+                           "mu.stems",
+                           "siteplot.effect",
+                           "siteplot.sigma",
+                           "site.sigma",
+                           "stem.coefs"), 
+    model.file = textConnection(model.code),
+    n.chains = 1, 
+    n.iter = 210000, 
+    n.burnin = 10000, 
+    n.thin = 20
+  )
+  
+  
+  samples <- coda::mcmc(modelfit$BUGSoutput$sims.matrix, start = 1, thin = 1)
+  save(samples, file = ModelPath)
+  
+} else {
+  samples <- load_from(ModelPath)
+}
+  
+```
+
+
+Separate posterior samples into those for parameters and those for species x plot log-likelihoods.
+
+```{r}
+
+ii <- str_detect(colnames(samples), "loglik")
+post.loglik <- as.matrix( samples[, ii] )
+post.samples <- samples[, !ii]
+
+rm(samples)
+gc()
+
+```
+
+
+### Check model convergence for parameters
+
+Geweke's diagnostic for model convergence.
+
+```{r}
+
+g <- coda::geweke.diag(post.samples)
+ok <- (2 * pnorm(abs(g$z), lower.tail = FALSE) > 0.05)
+p <- sum(ok, na.rm = TRUE) / length(na.omit(ok))
+
+cat(round(p * 100, 2), "percent of parameters converged")
+
+```
+Manual inspection of trace plots for a selection of the parameters that did not meet the Geweke criterion suggested that they had converged.
+
+
+Check for parameters with less than 4000 effectively independent samples. Note, parameter lv.coefs[1,3] will always have zero effective samples because its value is fixed at zero in the model.
+
+```{r}
+
+x <- coda::effectiveSize(post.samples)
+ii <- x < 4000
+
+if (sum(ii) > 1) {
+  cat(sum(ii) - 1, "free parameters with less than 4000 samples\n")
+  print(x[ii])
+} else {
+  cat("All free parameters have at least 4000 samples")
+}
+
+```
+
+Convert posterior samples to a plain matrix.
+
+```{r}
+
+post.samples <- as.matrix(post.samples)
+
+```
+
+
+### Model results
+
+#### Mean stem density estimates
+
+Here we compare the mean stem density estimates made by the integrated model to observed sub-plot counts and estimates made by the separate JAGS stem density model. The interest here is in the degree of influence that species occurrence data had on stem density estimates in the integrated model.
+
+In the following graphs for each 9ha plot, points show observed stem counts for 0.1ha sub-plots; the solid line and surrounding shaded region show the model's estimates of mean stem density; and the dashed line shows the corresponding estimates from the separate JAGS stem density model. The degree of separation between the solid and dashed lines reflects the strengh of influence of patterns of species occurrence over all plots.
+
+
+```{r}
+
+ii <- str_detect(colnames(post.samples), "mu.stems")
+
+# Summary statistics for stem density means fitted by the stem count sub-model
+dat.stems.fitted <- post.samples[, ii] %>%
+  as.data.frame() %>%
+  
+  mutate(iter = row_number()) %>%
+  tidyr::gather(param, value, -iter) %>%
+  
+  mutate(nums = str_extract(param, "\\d+\\,\\d+"),
+         plot = as.integer(str_extract(nums, "^\\d+")),
+         sizeclass = as.integer(str_extract(nums, "\\d+$"))) %>%
+  
+  group_by(plot, sizeclass) %>%
+  do({
+    mid <- median(.$value)
+    q95 <- hpdi(.$value, 0.95)
+    
+    data.frame(lwr95 = q95[1, "lower"],
+               mid = mid,
+               upr95 = q95[1, "upper"])
+  })
+
+
+# Median estimages of stem means from the separately fitted JAGS model
+path <- here::here("models", "fitted", "jags_subplotstems_median_params.RData")
+
+dat.stems.jags <- load_from(path) %>%
+  data.frame(param = names(.), mid = .) %>%
+  filter(str_detect(param, "^mu")) %>%
+  
+  mutate(nums = str_extract(param, "\\d+\\,\\d+"),
+         plot = as.integer(str_extract(nums, "^\\d+")),
+         sizeclass = as.integer(str_extract(nums, "\\d+$"))) %>%
+  
+  select(plot, sizeclass, mid)
+
+
+# Function to draw graphs for a subset of data
+fn_plot <- function(the.plots) {
+  dat.obs <- DAT.stems.observed %>% filter(plot %in% the.plots)
+  
+  dat.fit <- dat.stems.fitted %>% 
+    filter(plot %in% the.plots) %>% 
+    mutate(set = "Integrated model")
+  
+  dat.jags <- dat.stems.jags %>% 
+    filter(plot %in% the.plots) %>%
+    mutate(set = "Stems model")
+
+  
+  xbreaks <- seq(2, 10, 2)
+  
+  ggplot() +
+    geom_jitter(data = dat.obs, 
+               aes(x = sz, y = nstems),
+               height = 0, width = 0.1, shape = 1) +
+    
+    geom_ribbon(data = dat.fit, 
+                aes(x=sizeclass, ymin=lwr95, ymax=upr95), 
+                colour = "grey", alpha=0.25, show.legend = FALSE) +
+    
+    geom_line(data = dat.fit, 
+              aes(x = sizeclass, y=mid), 
+              colour = "black", linetype = "solid") +
+    
+    geom_line(data = dat.jags, 
+              aes(x = sizeclass, y=mid), 
+              colour = "black", linetype = "dashed") +
+    
+    scale_x_continuous(breaks = xbreaks, labels = 10*xbreaks) +
+    
+    labs(x = "Tree size class", y = "Number of stems per 0.1ha")
+}
+
+
+facet.labels <- paste(
+  rep(1:22, each=3),
+  rep(1:3, 22),
+  sep = ":"
+)
+
+names(facet.labels) <- 1:66
+
+```
+
+```{r fig.height=8}
+
+for (i in seq(1, 66, 6)) {
+  the.plots <- i:(i+5)
+  
+  print( fn_plot(the.plots) +
+           facet_wrap(~ plot, scales = "free_y", 
+               labeller = as_labeller(facet.labels)) )
+}
+
+```
+
+
+#### Species coefficients on stem density
+
+The graph below shows median values for species coefficients on stem density for each of the six (grouped) tree size classes based on data over all plots. Positive values indicate a higher probability of occurrence and negative values a lower probability. 
+
+Warning!! This is breaking McElreath's rule - "You should not try to interpret a non-trivial model by examining coefficients. Instead look at predictions."
+
+
+```{r}
+
+ii <- str_detect(colnames(post.samples), "^stem.coefs")
+
+x <- apply(post.samples[, ii], MARGIN=2, median)
+
+model.stemeffects <- data.frame(
+  param = names(x),
+  median.value = x,
+  stringsAsFactors=FALSE) %>%
+  
+  mutate(nums = str_extract(param, "\\d+\\,\\d+"),
+         spnum = as.integer(str_extract(nums, "^\\d+")),
+         sizeclass = as.integer(str_extract(nums, "\\d+$"))) %>%
+  
+  # Scale coefficient values within each size class to account
+  # for the unstandardized stem counts used in the model
+  group_by(sizeclass) %>%
+  mutate(median.value = scale(median.value)) %>%
+  ungroup() %>%
+  
+  # Add species info
+  left_join(SpeciesSubset %>% mutate(spnum = row_number()),
+            by = "spnum") %>%
+  
+  mutate(status = ifelse(is.na(weed), "Indet", ifelse(weed, "Exotic", "Native")),
+         group = ifelse(status == "Exotic", "exotic", 
+                        ifelse(habitat == "terrestrial", "dry", "wet")) ) %>%
+
+  select(spnum, workingname, status, group, sizeclass, median.value)
+  
+
+# Cluster species based on their vectors of sizeclass variable inclusion rates.
+# Do this separately for native/dry, native/wet and exotic species
+x <- model.stemeffects %>%
+  tidyr::spread(sizeclass, median.value, sep="_") %>%
+
+  group_by(group) %>%
+  do (
+    {
+      n <- nrow(.)
+      d <- dist(.[, paste0("sizeclass_", 1:6)])  # euclidean distance
+      h <- hclust(d, method = "complete")
+      data.frame(spnum = .$spnum[h$order], rank = 1:n)
+    }
+  )
+
+
+dat.gg <- left_join(model.stemeffects, x, 
+                    by = c("spnum", "group"))
+
+# Record order of species names to use as factor levels for ggplot
+levels <- dat.gg %>%
+  arrange(group, rank) %>%
+  distinct(workingname)
+
+dat.gg <- dat.gg %>%
+  mutate(workingname = factor(workingname, levels = levels$workingname),
+         group = factor(group, 
+                        levels = c("exotic", "dry", "wet"),
+                        labels = c("Exotic", "Native dry", "Native damp/wet")))
+
+```
+
+
+```{r fig.height=12, fig.width=8}
+
+xlabels <- SizeClasses %>%
+  str_replace("less", "<") %>%
+  str_replace("from", "") %>%
+  str_replace("to", "-")
+
+i <- length(xlabels)
+xlabels[i] <- paste0(">", xlabels[i])
+
+
+gg <- ggplot(data = dat.gg) +
+  geom_raster(aes(x = sizeclass, y = workingname, fill = median.value)) +
+  
+  scale_fill_gradient2(name = "Effect",
+                       low = "#7b3294", mid = "#fafafa", high = "#008837") +
+  
+  scale_x_continuous(breaks = 1:6, labels = xlabels) +
+  
+  labs(x = "Size class", y = "Species",
+       title = "Median species coefficients on stem size classes") +
+  
+  facet_grid(group ~ ., scales = "free_y", space = "free_y")
+
+
+gg_pdf(plot = gg, 
+       file = here("models/outputs/model_chosen_stem_effects.pdf"), 
+       size = pagesize("A3"))
+
+print(gg)
+
+```
+
+
+#### Predict on training data
+
+We derive predictions for the occurrence of each species in each plot based on the training data, i.e. posterior predictive checking of the model. For each species x plot case, predicted probability of occurrence is based on the plot-level random effect, the two plot latent variable values, the six mean values for fitted mean stem density within size class, and the plot's flood group.
+
+Predicted probability of occurrence for species i in plot j is given by:
+
+```
+ phi(p) = lv.coefs[i,1] + 
+          lv.coefs[i,2:3] %*% lvs[j,1:2] +
+          flood.coefs[i, flood.group[j]] +
+          stem.coefs[i, 1:6] %*% X.stems[j, 1:6] +
+          siteplot.effect[j]
+          
+ where X.stems is grouped sums of individual size class means mu.stems
+```
+
+```{r}
+
+model.linpred.Path <- here::here("models", "fitted", "model_chosen_linpred.RData")
+
+if (REFIT_MODELS || !file.exists(model.linpred.Path)) {
+  
+  nplots <- model.data$nplots
+  nspecies <- model.data$nspecies
+  nfloodgrp <- n_distinct(model.data$floodgroup)
+  nsizeclasses <- model.data$nsizeclasses
+  
+  # Check that we have the correct lookup list for field to
+  # model size classes
+  stopifnot(length(FieldToModelSizeClass) == nsizeclasses)
+  
+  niter <- nrow(post.samples)
+  
+  get_indices <- function(ptn, n.expected = NULL) {
+    ii <- str_detect(colnames(post.samples), ptn)
+    if (!is.null(n.expected)) {
+      stopifnot(sum(ii) == n.expected)
+    }
+    ii
+  }
+  
+  ii.lvcoefs <- get_indices("lv.coefs", nspecies * 3)
+  ii.stemcoefs <- get_indices("stem.coefs", nspecies * nsizeclasses)
+  ii.floodcoefs <- get_indices("flood.coefs", nspecies * nfloodgrp)
+  ii.siteplot.effect <- get_indices("siteplot.effect", nplots)
+
+  ii.lvs <- get_indices("lvs", nplots * 2)
+  ii.mu.stems <- get_indices("mu.stems", nplots * 11) # 11 field size classes
+  
+  m.floodgroup <- matrix(0, nrow = nplots, ncol = nfloodgrp)
+  ii <- cbind(1:nplots, model.data$floodgroup)
+  m.floodgroup[ii] <- 1
+  
+  model.linpred <- array(0, dim = c(nplots, nspecies, niter))
+  
+  for (ipost in 1:niter) {
+    # contribution of species intercept and latent variables
+    lv.coefs <- matrix(post.samples[ipost, ii.lvcoefs], nrow = nspecies)
+    lvs <- cbind(1, matrix(post.samples[ipost, ii.lvs], nrow = nplots))
+    eta <- tcrossprod(lvs, lv.coefs)
+    
+    # contribution of stem density
+    stem.coefs <- matrix(post.samples[ipost, ii.stemcoefs], nrow = nspecies)
+    mu.stems <- matrix(post.samples[ipost, ii.mu.stems], nrow = nplots)
+    
+    # aggregate modelled field counts to the broader six size classes
+    X.stems <- lapply(FieldToModelSizeClass, function(cols) {
+      x <- rep(0, nplots)
+      for (k in cols) {
+        x <- x + mu.stems[,k]
+      }
+      x
+    })
+    X.stems <- do.call(cbind, X.stems)
+    
+    eta <- eta + tcrossprod(X.stems, stem.coefs)
+    
+    # contribution of flood group
+    flood.coefs <- matrix(post.samples[ipost, ii.floodcoefs], nrow = nspecies)
+    eta <- eta + tcrossprod(m.floodgroup, flood.coefs)
+    
+    # row effects (vector)
+    row.coefs <- post.samples[ipost, ii.siteplot.effect]
+    eta <- eta + row.coefs
+    
+    model.linpred[,,ipost] <- eta
+  }
+  
+  save(model.linpred, file = model.linpred.Path)
+  
+} else {
+  model.linpred <- load_from(model.linpred.Path)
+}
+
+```
+
+
+#### Compare predicted and observed species richness
+
+Sum occurrence probabilities within each plot to arrive at posterior estimates of species richness, and compare to observed values.
+
+```{r}
+
+predicted.richness <- apply(model.linpred, MARGIN = 1, 
+                            FUN = function(lp) {
+                              # lp will have species as rows, samples as cols
+                              rich <- colSums(pnorm(lp))
+                              q50 <- unname( hpdi(rich, 0.5)[1,] )
+                              q95 <- unname( hpdi(rich, 0.95)[1,] )
+                              c(q95[1], q50[1], median(rich), q50[2], q95[2])
+                            })
+
+predicted.richness <- t(predicted.richness) 
+colnames(predicted.richness) <- c("lwr95", "lwr50", "mid", "upr50", "upr95")
+
+dat.gg <- as.data.frame(predicted.richness) %>%
+  mutate(plot = row_number(),
+         site = 1 + (plot - 1) %/% 3,
+         observed = rowSums(model.data$y),
+         label = ifelse(plot %% 3 == 2, site, ""))
+
+dat.bkg <- dat.gg %>%
+  group_by(site) %>%
+  summarize(xmin = min(plot) - 0.5, xmax = max(plot) + 0.5) %>%
+  ungroup() %>%
+  
+  mutate(ymin = min(dat.gg$lwr95) - 1, 
+         ymax = max(dat.gg$upr95) + 1,
+         filled = site %% 2 == 0)
+
+gg <- ggplot(data = dat.gg) +
+  geom_rect(data = dat.bkg, 
+            aes(xmin = xmin, xmax = xmax, 
+                ymin = ymin, ymax = ymax,
+                fill = filled),
+            show.legend = FALSE) +
+  
+  scale_fill_manual(values = c("#ffffff00", "#dfdfdfff")) +
+  
+  geom_linerange(aes(x = plot, ymin = lwr95, ymax = upr95),
+                 size = 0.75, colour = "grey50") +
+  
+  geom_linerange(aes(x = plot, ymin = lwr50, ymax = upr50),
+                 size = 2.5, colour = "grey50") +
+  
+  geom_point(aes(x = plot, y = observed), size = 4) +
+  
+  scale_x_continuous(breaks = 1:66, labels = dat.gg$label) +
+  
+  scale_y_continuous(limits = c(9,51)) +
+  
+  labs(x = "Site", y = "Species richness",
+       title = "Comparison of observed and predicted species richness within 9ha plots",
+       subtitle = paste("Points are observed values.",
+                        "Thick and thin lines are 50% and 95% HPD intervals.")) +
+  
+  coord_flip() +
+  
+  theme(axis.ticks.y = element_blank())
+
+
+gg_pdf(gg, "model_chosen_postpred_check_richness.pdf", pagesize('A4', 'portrait'))
+
+print(gg)
+
+```
+
+
+Posterior distribution of site and plot-within-site random effect standard deviations.
+
+```{r}
+
+xcols <- c("site.sigma", "siteplot.sigma")
+
+dat.gg <- as.data.frame( post.samples[, xcols]) %>%
+  tidyr::pivot_longer(everything(), names_to = "var") %>%
+  mutate(var = factor(var, levels = xcols, labels = c("site", "plot-within-site")))
+
+gg <- ggplot(data = dat.gg) +
+  geom_density(aes(x = value, fill = var), alpha = 0.5) +
+  scale_fill_discrete("Random effect") +
+  scale_x_continuous(breaks = seq(0.5, 2.5, 0.5)) +
+  labs(title = "Posterior distribution of random effect standard deviation")
+
+gg_pdf(gg, "model_chosen_random_effect_sigma.pdf")
+
+print(gg)
+
+```
+
+
+Next we examine the predictions for individual species occurrence in plots and compare these to the observations.
+
+```{r}
+
+# This will give summary matrices for each species stacked
+# one on the other
+predicted.occurrence <- lapply(1:nspecies, function(sp) {
+  lp <- model.linpred[,sp,]
+  
+  # transpose matrix lp to have samples as rows, plots as columns
+  lp <- t(lp)
+  prob <- pnorm(lp)
+  
+  q50 <- hpdi(prob, 0.5)
+  q95 <- hpdi(prob, 0.95)
+  
+  q <- cbind(sp,
+             plot = 1:ncol(prob),
+             lwr95 = q95[,1],
+             lwr50 = q50[,1],
+             mid = apply(prob, MARGIN = 2, median),
+             upr50 = q50[,2],
+             upr95 = q95[,2])
+
+  q
+})
+
+predicted.occurrence <- do.call(rbind, predicted.occurrence)
+
+x <- as.data.frame(model.data$y)
+colnames(x) <- 1:ncol(x)
+
+x <- x %>%
+  mutate(plot = row_number()) %>%
+  tidyr::gather(sp, observed, -plot, convert = TRUE)
+
+dat.gg.all <- predicted.occurrence %>%
+  as.data.frame() %>%
+  left_join(x, by = c("plot", "sp")) %>%
+  mutate(observed = factor(observed, levels = 0:1, labels = c("absent", "present")))
+
+
+labels <- SpeciesSubset$workingname
+names(labels) <- 1:length(labels)
+
+
+plot_fn <- function(the.spp) {
+  dat.gg <- dat.gg.all %>%
+    dplyr::filter(sp %in% the.spp)
+
+  ggplot(data = dat.gg, aes(x = plot)) +
+    geom_point(aes(y = mid, shape = observed),
+               size = 3, alpha = 0.6) +
+    
+    scale_shape_manual(breaks = c("absent", "present"), values = c(1, 16)) +
+    
+    labs(x = "Plot order", y = "Probability of occurrence") +
+    
+    facet_wrap(~ sp, labeller = as_labeller(labels)) +
+    theme(axis.ticks.x = element_blank(), axis.text.x = element_blank())
+}
+
+```
+
+
+```{r}
+
+for (i in seq(1, 95, 6)) {
+  the.spp <- i:min(i+5, 95)
+  
+  gg <- plot_fn(the.spp)
+  
+  filename <- paste0("species_probs_", min(the.spp), "_", max(the.spp), ".pdf")
+  gg_pdf(gg, filename)
+  
+  print(gg)
+}
+
+```
+
+
+#### Predictions for new site data
+
+The following function derives predictions given new site data. The code is adapted from the `boral::predict` function for marginal predictions using Monte Carlo integration over latent variables.
+
+Note that the function *assumes* parameter names used with the model fitted above, and the matrix algebra used within the function *assumes* that groups of parameters (e.g. 'lv.coefs') are arranged in the same order as they would be in output from a `boral` model. Terrible things will happen silently if this is not the case!
+
+```{r}
+
+predict_new_sites <- function (post.samples, 
+                               Xstems, 
+                               floodgroups = 1:3, 
+                               num.lv = 2, sd.lv = 1, lv.mc = 1000) {
+
+  stopifnot(is.matrix(post.samples))
+
+  post.names <- colnames(post.samples)
+  
+  # Function to get indices of specified parameters from posterior matrix
+  get_indices <- function(param.label, num.expected = NULL) {
+    ii <- str_detect(post.names, param.label)
+    nii <- sum(ii)
+    
+    if (is.null(num.expected)) {
+      if (nii == 0) stop(param.label, " is not in post.samples")
+    } else if (nii != num.expected) {
+      msg <- paste("Expected", num.expected, "variables for", param.label, "but found", nii)
+      stop(msg)
+    }
+    
+    ii
+  }
+  
+  
+  # check number of species, tree size classes and flood 
+  # groups by looking at posterior samples
+  ii <- get_indices("flood.coefs")
+  inds <- str_extract(post.names[ii], "\\d+,\\d+")
+  nspp <- length(unique(str_extract(inds, "^\\d+")))
+  
+  # Number of flood groups in posterior samples
+  npostflood <- length(unique(str_extract(inds, "\\d+$")))
+
+  # Number of flood groups to do predictions for
+  nflood <- length(floodgroups)
+  
+  ii <- get_indices("stem.coefs")
+  inds <- str_extract(post.names[ii], "\\d+,\\d+")
+  nsizes <- length(unique(str_extract(inds, "\\d+$")))
+  
+  
+  stopifnot(is.matrix(Xstems), 
+            ncol(Xstems) == nsizes)
+
+  nsites <- nrow(Xstems)
+  
+  stopifnot(is.vector(floodgroups),
+            is.numeric(floodgroups),
+            nflood <= npostflood,
+            all(floodgroups %in% 1:npostflood))
+  
+  
+  Xflood <- array(0, dim = c(nflood, nsites, npostflood))
+  for (f in 1:nflood) {
+    for (i in 1:nsites) Xflood[f, i, floodgroups[f]] <- 1
+  }
+
+  
+  # Array to store linear predictor values for sites X spp X flood groups
+  all_linpred <- array(NA, dim = c(nsites, nspp, nflood, nrow(post.samples)))
+
+
+  # Latent variable values from multi-variate normal where all 
+  # off-diagonal covariances are 0
+  mc_lv <- rnorm(nsites * lv.mc * num.lv, mean = 0, sd = sd.lv)
+  mc_lv <- array(mc_lv, dim = c(lv.mc, nsites, num.lv))
+    
+  
+  # Array to hold linear predictor values for one posterior sample
+  # and one flood group over all tuples of MC latent variables
+  all_linpredmc <- array(NA, dim = c(nsites, nspp, lv.mc))
+  
+  # Loop through posterior samples
+  pb <- txtProgressBar(max = nrow(post.samples), style = 3)
+  for (ipost in 1:nrow(post.samples)) {
+    setTxtProgressBar(pb, ipost)
+    
+    ii <- get_indices("lv.coefs", nspp * (num.lv + 1))
+    lvcoefs <- matrix(post.samples[ipost, ii], nrow = nspp)
+    
+    ii <- get_indices("stem.coefs", nspp * ncol(Xstems))
+    stemcoefs <- matrix(post.samples[ipost, ii], nrow = nspp)
+    
+    ii <- get_indices("flood.coefs", nspp * npostflood)
+    floodcoefs <- matrix(post.samples[ipost, ii], nrow = nspp)
+    
+    Xcoefs <- cbind(stemcoefs, floodcoefs)
+    
+    # For the nested random effect, we calculate the
+    # plot-level standard deviation as the root sum of squares of 
+    # the site and the plot-within-site standard deviations.
+    #
+    ii <- get_indices("site.sigma", 1)
+    site.sigma <- post.samples[ipost, ii]
+    
+    ii <- get_indices("siteplot.sigma", 1)
+    siteplot.sigma <- post.samples[ipost, ii]
+    
+    overall.sigma <- sqrt(site.sigma^2 + siteplot.sigma^2)
+    
+    rowcoefs <- matrix(
+      rnorm(nsites * lv.mc, mean = 0, sd = overall.sigma), 
+      ncol = lv.mc )
+    
+    for (f in 1:nflood) {
+      X <- cbind(Xstems, Xflood[f,,])
+
+      for (b in 1:lv.mc) {
+        eta <- tcrossprod(mc_lv[b, , ], lvcoefs[, 2:(num.lv + 1)])
+        
+        eta <- eta + 
+          tcrossprod(cbind(1, X), cbind(lvcoefs[, 1], Xcoefs))
+        
+        # note: this relies on recyling the vector of row coefs across
+        # columns of the matrix eta
+        eta <- eta + rowcoefs[, b]
+        
+        all_linpredmc[, , b] <- eta
+        rm(eta)
+      }
+      
+      all_linpred[, , f, ipost] <- apply(all_linpredmc, c(1,2), mean)
+    }
+    
+    all_linpredmc[,,] <- NA
+  }
+  close(pb)
+  
+  # Return array of linear predictor values [site, sp, floodgroup, sample]
+  all_linpred
+}
+
+```
+
+
+##### Create data for a range of stand structures
+
+We create a set of artificial sites covering a range of stand configurations (size X density combinations). These are based on quantiles of **mean** stem counts within grouped diameter size classes
+
+We use the posterior samples of mean stem counts from the fitted model. This takes into account the different number of sub-plots for the smallest size class. We treat each posterior sample as a sub-plot observation to get quantiles that reflect the range of fitted means.
+
+```{r}
+
+# Retrieve posterior samples for mean stem counts within plot X size class.
+# This assumes mu.stems params are ordered by plot (first index) within size 
+# class (second index)
+# i.e. mu.stems[plot1, sz1], mu.stems[plot2, sz1] ... mu.stems[plot66, sz11]
+ii <- str_detect(colnames(post.samples), "mu.stems")
+
+nr <- nrow(post.samples)
+dat.mu <- array(NA, dim = c(66, 11, nr))
+for (r in 1:nr) dat.mu[,,r] <- post.samples[r,ii]
+
+# Group size classes as per model: 1,2,3,4,5-8,9-11
+for (r in 1:nr) {
+  dat.mu[,5,r] <- rowSums(dat.mu[,5:8,r])
+  dat.mu[,6,r] <- rowSums(dat.mu[,9:11,r])
+}
+dat.mu <- dat.mu[,1:6,]
+
+
+# Determine quantiles for each size class
+probs <- seq(0.1, 0.9, 0.1)
+qdat <- sapply(1:6, function(sz) quantile(dat.mu[,sz,], probs))
+  
+```
+
+
+New sites with varying density of selected (grouped) size classes:
+
+```{r}
+
+# Small trees (first two size classes, <=20cm); other size classes set to median values
+Xstems.small <- qdat
+for (k in 3:6) Xstems.small[,k] <- qdat[5,k]
+
+
+# New sites with varying density of intermediate size classes (<30cm, <40cm)
+Xstems.intermediate <- qdat
+for (k in c(1,2,5,6)) Xstems.intermediate[,k] <- qdat[5,k] 
+
+# New sites with varying density of the largest trees (<80cm, >80cm)
+Xstems.large <- qdat
+for (k in 1:4) Xstems.large[,k] <- qdat[5,k]
+
+# New sites with varying density of all but the largest size class.
+Xstems.all <- qdat
+Xstems.all[,6] <- qdat[5,6]
+
+
+# Additional new sites to sample the extremes of stand structure
+
+# small 90%, intermediate 10%, large 10%
+Xstems.dense.Sm <- cbind(qdat[9, 1:2, drop=FALSE], 
+                         qdat[1, 3:6, drop=FALSE])
+
+# small 10%, intermediate 90%, large 10%
+Xstems.dense.In <- cbind(qdat[1, 1:2, drop=FALSE],
+                         qdat[9, 3:4, drop=FALSE], 
+                         qdat[1, 5:6, drop=FALSE])
+
+# small 10%, intermediate 10%, large 90%
+Xstems.dense.Lg <- cbind(qdat[1, 1:4, drop=FALSE], 
+                         qdat[9, 5:6, drop=FALSE])
+
+# small 90%, intermediate 90%, large 10%
+Xstems.dense.SmIn <- cbind(qdat[9, 1:4, drop=FALSE], 
+                           qdat[1, 5:6, drop=FALSE])
+
+# small 90%, intermediate 10%, large 90%
+Xstems.dense.SmLg <- cbind(qdat[9, 1:2, drop=FALSE],
+                           qdat[1, 3:4, drop=FALSE], 
+                           qdat[9, 5:6, drop=FALSE])
+
+# small 10%, intermediate 90%, large 90%
+Xstems.dense.InLg <- cbind(qdat[1, 1:2, drop=FALSE],
+                           qdat[9, 3:6, drop=FALSE])
+
+```
+
+
+Combine data and allow for duplicate records (all size classes at median value).
+
+```{r}
+
+Xstems.new <- rbind(
+  Xstems.small, 
+  Xstems.intermediate, 
+  Xstems.large, 
+  Xstems.all)
+
+sznames <- c("<10cm", "<20cm", "<30cm", "<40cm", "<80cm", ">80cm")
+colnames(Xstems.new) <- sznames
+rownames(Xstems.new) <- NULL
+
+Xstems.new <- as.data.frame(Xstems.new) %>%
+  mutate(label = rep(c("small", "intermediate", "large", "all"), each = nrow(qdat)),
+         label = paste0(label, probs * 100))
+
+# Extra sites to represent stand extremes
+fn <- function(x, label) cbind(as.data.frame(x), label) 
+
+extras <- rbind(fn(Xstems.dense.Sm, "dense Sm"), 
+                fn(Xstems.dense.In, "dense In"), 
+                fn(Xstems.dense.Lg, "dense Lg"),
+                fn(Xstems.dense.SmIn, "dense Sm.In"),
+                fn(Xstems.dense.SmLg, "dense Sm.Lg"),
+                fn(Xstems.dense.InLg, "dense In.Lg"))
+
+colnames(extras) <- c(sznames, "label")
+rownames(extras) <- NULL
+
+
+Xstems.new <- bind_rows(Xstems.new, extras) %>%
+  mutate(index = row_number())
+
+```
+
+
+Because of how Xstems.new has been constructed, there will be some records with the same stem density values, e.g. all sizes at median density. To save time, we only want to pass unique records to the prediction function. So we filter out the duplicates to create a second data set of unique records, but record the relationship between this and the original data set for graph purposes later.
+
+```{r}
+
+# Keep a unique set of stem densities for prediction
+Xstems.new.predict <- Xstems.new %>%
+  distinct_at(sznames, .keep_all = TRUE) %>%
+  mutate(index = row_number())
+
+
+# Make a lookup table that relates data row numbers to prediction 
+# row numbers to use when summarizing and graphing predictions.
+Xstems.lookup <- Xstems.new %>%
+  left_join(Xstems.new.predict, by = sznames) %>%
+  select(label = label.x, data.index = index.x, prediction.index = index.y)
+  
+
+Xstems.lookup <- Xstems.new %>%
+  select(label, data.index = index) %>%
+  mutate(prediction.index = fn(data.index, median.recs))
+
+```
+
+
+##### Compare artificial sites to actual sites
+
+We use MDS to display the relationship between the artificial data and the actual data (represented by median posterior stem density values from model 3A).
+
+```{r}
+
+# Median posterior stem densities for actual sites
+dat.actual <- apply(dat.mu, MARGIN = 1:2, median) %>%
+  as.data.frame()
+
+colnames(dat.actual) <- sznames
+
+dat.all <- bind_rows(
+  dat.actual %>% mutate(label = "actual"),
+  Xstems.new.predict %>% select(-index)
+)
+
+d <- dat.all %>% 
+  select(-label) %>%
+  scale(.) %>%
+  vegan::vegdist("euclidean")
+
+mds <- vegan::metaMDS(d, trymax = 50)
+
+dat.gg <- mds$points %>%
+  as.data.frame() %>%
+  mutate(label = dat.all$label,
+         label = str_extract(label, "^[a-z_]+"),
+         grp = ifelse(label == "actual", "observed", "artificial"))
+
+
+gg <- ggplot(data = dat.gg) +
+  geom_point(aes(x = MDS1, y = MDS2, colour = label, shape = grp),
+             size = 3) +
+  
+  scale_colour_discrete(name = "Data set") +
+  scale_shape_manual(name = "Data type", values = c(16, 1)) +
+  
+  labs(title = "Ordination of stem density data for actual and artificial sites")
+
+
+gg_pdf(gg, "hypothetical_sites_mds.pdf", pagesize("A4", "portrait"))
+
+print(gg)
+
+```
+
+
+##### Do predictions
+
+```{r}
+
+path <- here::here("models", "predictions", "model_chosen_new_site_predictions.RData")
+
+if (REFIT_MODELS || !file.exists(path)) {
+  res <- predict_new_sites(post.samples = post.samples,
+                           Xstems = as.matrix(Xstems.new.predict[, 1:6]))
+  
+  save(res, file = path)
+
+} else {
+  res <- load_from(path)
+}
+
+```
+
+
+##### Species richness predictions for 9ha plots
+
+Display predictions for the different stand configurations over each of the three flood groups.
+
+```{r}
+
+dat <- lapply(1:3, function(floodgrp) {
+  x <- res[,,floodgrp,]
+  rich <- apply(x, MARGIN = c(1,3), FUN = function(lp) sum(pnorm(lp)))
+  hpd50 <- hpdi(t(rich), 0.5)
+  hpd95 <- hpdi(t(rich), 0.95)
+  
+  data.frame(prediction.index = 1:nrow(rich),
+             floodgrp = floodgrp, 
+             lwr95 = hpd95[,1],
+             lwr50 = hpd50[,1],
+             mid = apply(rich, MARGIN = 1, FUN = median),
+             upr50 = hpd50[,2],
+             upr95 = hpd95[,2]
+  )
+})
+
+dat <- bind_rows(dat)
+
+dat.gg <- Xstems.lookup %>%
+  left_join(dat, by = "prediction.index") %>%
+  
+  mutate(grp = str_extract(label, "^[a-zA-Z\\s\\.]+"),
+         quant = as.integer(str_extract(label, "\\d+"))) %>%
+  
+  mutate(label = factor(label, levels = unique(label)),
+         floodgrp = factor(floodgrp))
+
+```
+
+
+```{r  fig.width=8, fig.height=10}
+
+dodgew <- 0.8
+
+gg <- ggplot(data = dat.gg, aes(x = label, colour = grp)) +
+  geom_linerange(aes(ymin = lwr95, ymax = upr95, group = floodgrp),
+                 position = position_dodge(width = dodgew),
+                 size = 0.5) +
+  
+  geom_linerange(aes(ymin = lwr50, ymax = upr50, group = floodgrp), 
+                 position = position_dodge(width = dodgew),
+                 size = 1) +
+  
+  geom_point(aes(y = mid, shape = floodgrp),
+             position = position_dodge(width = dodgew),
+             size = 2.5) +
+  
+  scale_color_discrete(name = "Varying size classes") +
+  scale_shape_discrete(name = "Flood group") +
+  
+  labs(x = "", y = "Predicted number of species",
+       title = "Predicted species richness over varying stand configurations",
+       subtitle = "Based on probability of occurrence for 95 modelling species") +
+  
+  coord_flip() + 
+  
+  # facet_wrap(~ floodgrp, labeller = label_both) +
+  
+  theme(panel.grid.major.x = element_line(colour = "grey70"))
+
+
+gg_pdf(gg, filename = "model_chosen_newsites_richness.pdf", size = pagesize())
+
+print(gg)
+
+```
+
+
+##### Native vs exotic species richness predictions for 9ha plots
+
+Display predictions for the different stand configurations, marginalized over all three flood groups.
+
+```{r}
+
+native.indices <- which(!SpeciesSubset$weed)
+exotic.indices <- which(SpeciesSubset$weed)
+
+# Function to calculate summary stats for richness over a 
+# subset of species, marginalized over all flood groups
+fn <- function(spp.indices) {
+  rich <- lapply(1:3, function(floodgrp) {
+    x <- res[, spp.indices, floodgrp,]
+    apply(x, MARGIN = c(1,3), FUN = function(lp) sum(pnorm(lp)))
+  })
+  
+  # summarize over all flood groups
+  rich <- do.call(cbind, rich)
+  hpd50 <- hpdi(t(rich), 0.5)
+  hpd95 <- hpdi(t(rich), 0.95)
+  
+  data.frame(
+    prediction.index = 1:nrow(rich),
+    lwr95 = hpd95[,1],
+    lwr50 = hpd50[,1],
+    mid = apply(rich, MARGIN = 1, FUN = median),
+    upr50 = hpd50[,2],
+    upr95 = hpd95[,2]
+  )
+}
+
+
+dat <- bind_rows(
+  fn(native.indices) %>% mutate(status = "Native"),
+  fn(exotic.indices) %>% mutate(status = "Exotic")
+)
+
+
+dat.gg <- Xstems.lookup %>%
+  left_join(dat, by = "prediction.index") %>%
+  
+  mutate(grp = str_extract(label, "^[a-z]+"),
+         quant = as.integer(str_extract(label, "\\d+")),
+         label = factor(label, levels = unique(label)))
+
+```
+
+
+```{r  fig.width=8, fig.height=10}
+
+dodgew <- 0
+
+gg <- ggplot(data = dat.gg, aes(x = label, colour = grp, group = status)) +
+  geom_linerange(aes(ymin = lwr95, ymax = upr95),
+                 position = position_dodge(width = dodgew),
+                 size = 0.75) +
+  
+  geom_linerange(aes(ymin = lwr50, ymax = upr50), 
+                 position = position_dodge(width = dodgew),
+                 size = 2) +
+  
+  geom_point(aes(y = mid, shape = status),
+                 position = position_dodge(width = dodgew),
+             size = 4) +
+  
+  scale_color_discrete(name = "Varying size classes") +
+
+  labs(x = "", y = "Predicted number of species",
+       title = "Predicted species richness over varying stand configurations",
+       subtitle = "Based on probability of occurrence for 95 modelling species") +
+  
+  coord_flip() + 
+  
+  # facet_wrap(~ status) +
+  
+  theme(panel.grid.major.y = element_line(colour = "grey70"))
+
+
+gg_pdf(gg, filename = "model_chosen_newsites_richness_nat_ex.pdf", size = pagesize())
+
+print(gg)
+
+```
+
+
+Alternative version of the above graph with the flood groups shown separately.
+
+```{r}
+
+native.indices <- which(!SpeciesSubset$weed)
+exotic.indices <- which(SpeciesSubset$weed)
+
+# Function to calculate summary stats for richness over a 
+# subset of species, marginalized over all flood groups
+fn <- function(spp.indices) {
+  dats <- lapply(1:3, function(floodgrp) {
+    x <- res[, spp.indices, floodgrp,]
+    rich <- apply(x, MARGIN = c(1,3), FUN = function(lp) sum(pnorm(lp)))
+  
+    hpd50 <- hpdi(t(rich), 0.5)
+    hpd95 <- hpdi(t(rich), 0.95)
+  
+    data.frame(
+      prediction.index = 1:nrow(rich),
+      floodgrp = floodgrp,
+      lwr95 = hpd95[,1],
+      lwr50 = hpd50[,1],
+      mid = apply(rich, MARGIN = 1, FUN = median),
+      upr50 = hpd50[,2],
+      upr95 = hpd95[,2]
+    )
+  })
+  
+  bind_rows(dats)
+}
+
+
+dat <- bind_rows(
+  fn(native.indices) %>% mutate(status = "Native"),
+  fn(exotic.indices) %>% mutate(status = "Exotic")
+)
+
+
+dat.gg <- Xstems.lookup %>%
+  left_join(dat, by = "prediction.index") %>%
+  
+  mutate(grp = str_extract(label, "^[a-z]+"),
+         quant = as.integer(str_extract(label, "\\d+")),
+         label = factor(label, levels = unique(label)),
+         floodgrp = factor(floodgrp))
+
+```
+
+
+```{r  fig.width=8, fig.height=10}
+
+dodgew <- 0.8
+
+gg <- ggplot(data = dat.gg, aes(x = label, colour = grp, group = floodgrp)) +
+  geom_linerange(aes(ymin = lwr95, ymax = upr95),
+                 position = position_dodge(width = dodgew),
+                 size = 0.5) +
+  
+  geom_linerange(aes(ymin = lwr50, ymax = upr50), 
+                 position = position_dodge(width = dodgew),
+                 size = 1.0) +
+  
+  geom_point(aes(y = mid, shape = floodgrp),
+                 position = position_dodge(width = dodgew),
+             size = 2.0) +
+  
+  scale_color_discrete(name = "Varying size classes") +
+
+  labs(x = "", y = "Predicted number of species",
+       title = "Predicted species richness over varying stand configurations",
+       subtitle = "Based on probability of occurrence for 95 modelling species") +
+  
+  coord_flip() + 
+  
+  facet_wrap(~ status, scales = "free_x") +
+  
+  theme(panel.grid.major.y = element_line(colour = "grey70"))
+
+
+gg_pdf(gg, filename = "model_chosen_newsites_richness_nat_ex_flood.pdf", size = pagesize())
+
+print(gg)
+
+```
+
+
+Two-way table style view of the median predictions of occurrence for species across the hypothetical stands, with separate figures for (a) general stands with either one size group varied and the others held at median values, or all groups (other than large) varied; (b) extreme stands with one or two size groups at 90th percentile density and the others at 10th percentile density.
+
+General stands:
+
+```{r}
+
+# matrix of mean probability of occurrence with sites as rows and
+# species as columns
+dat <- apply(res, MARGIN = c(1,2), function(lp) pnorm(mean(lp)))
+
+colnames(dat) <- SpeciesSubset$workingname
+
+dat.gg <- as.data.frame(dat) %>%
+  mutate(prediction.index = row_number()) %>%
+  
+  tidyr::pivot_longer(-prediction.index, values_to = "prob",
+                      names_to = "species", ) %>%
+  
+  mutate(prob = round(prob, 2)) %>%
+  
+  left_join(Xstems.lookup, by = "prediction.index") %>%
+  
+  # To simplify the graph, just keep the data for stands 
+  # at 20, 40, 60, 80th percentiles
+  filter(str_detect(label, "[2468]0$")) %>%
+  
+  # Vars for graph ordering
+  mutate(sizegroup = str_extract(label, "^[a-z]+"),
+         sizegroup = factor(sizegroup, 
+                            levels = c("small", "intermediate", "large", "all")),
+         sizepercentile = str_extract(label, "\\d+"))
+
+
+trans_species_prob <- scales::trans_new(
+  "sp_prob",
+  transform = function(p) ifelse(p == 0, -5, log(p)),
+  inverse = function(x) ifelse(x <= -5, 0, exp(x))
+)
+
+gg <- ggplot(data = dat.gg) +
+  geom_tile(aes(x = sizepercentile, y = species, fill = prob)) +
+  
+  scale_fill_gradient(low = "#ffffff", high = "#000000", trans = trans_species_prob) +
+  
+  scale_x_discrete(position = "top") +
+  
+  facet_grid(cols = vars(sizegroup)) +
+  
+  labs(x = "", y = "") +
+  
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill=NA,colour="grey50"),
+        panel.spacing=unit(0,"cm"))
+
+
+gg_pdf(gg, "model_chosen_hypothetical_general_spp.pdf", pagesize("A3", "portrait"))
+
+print(gg)
+
+```
+
+
+Extreme stands:
+
+```{r}
+
+# matrix of mean probability of occurrence with sites as rows and
+# species as columns
+#dat <- apply(res, MARGIN = c(1,2), function(lp) pnorm(mean(lp)))
+#
+#colnames(dat) <- SpeciesSubset$workingname
+
+dat.gg <- as.data.frame(dat) %>%
+  mutate(prediction.index = row_number()) %>%
+  
+  tidyr::pivot_longer(-prediction.index, values_to = "prob",
+                      names_to = "species", ) %>%
+  
+  mutate(prob = round(prob, 2)) %>%
+  
+  left_join(Xstems.lookup, by = "prediction.index") %>%
+  
+  # Subset to data for extreme stands
+  filter(str_detect(label, "dense")) %>%
+  mutate(label = str_replace(label, "dense ", ""),
+         label = factor(label, 
+                        levels = c("Sm", "In", "Lg", "Sm.In", "Sm.Lg", "In.Lg"),
+                        labels = c("Small", "Int", "Large", 
+                                   "Small+Int", "Small+Large", "Int+Large")))
+  
+
+gg <- ggplot(data = dat.gg) +
+  geom_tile(aes(x = label, y = species, fill = prob)) +
+  
+  scale_fill_gradient(low = "#ffffff", high = "#000000", trans = trans_species_prob) +
+  
+  scale_x_discrete(position = "top") +
+  
+  labs(x = "", y = "")
+  
+
+gg_pdf(gg, "model_chosen_hypothetical_extreme_spp.pdf", pagesize("A3", "portrait"))
+
+print(gg)
+
+```
+
+
+
