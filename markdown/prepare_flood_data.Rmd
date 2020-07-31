@@ -1,0 +1,304 @@
+---
+title: "Prepare flood data"
+output:
+  word_document: 
+    fig_height: 6
+    fig_width: 8
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(dplyr)
+library(ggplot2)
+library(mice)
+library(stringr)
+library(tidyr)
+library(vegan)
+
+library(runjags)
+
+# Load common functions
+source(file = here("scripts", "common_functions.R"))
+
+# Default graph theme
+theme_set( theme_bw() )
+
+set.seed(42)
+
+```
+
+
+## Source data
+
+The source data were derived from a time series of 672 Landsat images for the period 1986 to 2016. For each image date, the data are the proportion of each experimental plot visibly inundated and the proportion that was cloud-free. For records where the cloud cover over a plot was 75% or less, we simply apply the observed inundation value to the whole plot. For records with higher levels of cloud cover we treat the inundation value as missing. 
+
+**Note:** The kludge treatment of cloud cover takes no account of any correlation between flooding and cloud, or of the pattern cloud cover across plots for a given date. Perhaps missing value imputation could be applied (?)
+
+```{r}
+
+path <- here("../red_gum_thinning/flooding/data/inundation.RData")
+
+DAT <- load_from(path) %>%
+  mutate(date = as.Date(date))
+
+dates <- distinct(DAT, date) %>% arrange(date)
+  
+DAT <- DAT %>%
+  
+  mutate(siteplot = paste0(site, "-", plot),
+         siteplot = factor(siteplot, levels = paste0(rep(1:22, each=3), "-", 1:3)),
+         
+         date = as.Date(date),
+         date.index = match(date, dates$date),
+         p.flood = ifelse(prop.cloudfree > 0.25, prop.inundated, NA),
+         is.flood = as.integer(p.flood > 0)) %>%
+  
+  select(site, plot, siteplot, date, date.index, p.flood, is.flood, p.cloud = prop.cloudfree) %>%
+  mutate(p.cloud = 1 - p.cloud) %>%
+  
+  arrange(site, plot)
+
+```
+
+
+## Classify plots based on flood history
+
+Here we classify the plot flood data to search for groupings of plots with similar flood histories. We apply a hierarchical classification using Ward clustering and Jaccard distances.
+
+```{r}
+
+dat <- DAT %>%
+  filter(!is.na(p.flood)) %>%
+  select(siteplot, date.index, is.flood) %>%
+  tidyr::spread(date.index, is.flood, fill = 0)
+
+siteplot <- dat[["siteplot"]]
+dat <- as.matrix(dat[, -1])
+rownames(dat) <- siteplot
+
+dat.d <- vegan::vegdist(dat[, -(1:2)], method = "jaccard", binary = TRUE)
+
+dat.hc <- hclust(dat.d, method = "ward.D2")
+plot(dat.hc)
+
+```
+
+Based on the dendrogram we define three broad flood history groups.
+
+```{r}
+
+DAT.floodgroup <- data.frame(
+  siteplot,
+  floodgroup = as.factor( cutree(dat.hc, k = 3) ) ) %>%
+  
+    mutate(site = as.integer(str_extract(siteplot, "^\\d+")),
+         plot = as.integer(str_extract(siteplot, "\\d+$")) )
+  
+
+```
+  
+  
+An alternative view of the plot groups in ordination space.
+
+```{r}
+
+dat.mds <- MASS::isoMDS(dat.d, trace = FALSE)$points %>%
+  as.data.frame() %>%
+  rename(mds1 = 1, mds2 = 2) %>%
+  bind_cols(floodgroup = DAT.floodgroup$floodgroup)
+
+ggplot(data = dat.mds) +
+  geom_point(aes(x = mds1, y = mds2, colour = floodgroup),
+             size = 5, shape = 1) +
+  
+  coord_equal() +
+  
+  labs(title = "Sites positioned by MDS based on flood history")
+  
+```
+
+
+The graph below shows flood occurrence over time, with plots arranged into the groups derived above.
+
+
+```{r fig.height=8, fig.width=10}
+
+siteplot.order <- arrange(DAT.floodgroup, floodgroup, siteplot)
+
+dat.gg <- DAT %>%
+  select(date, siteplot, is.flood) %>%
+  filter(!is.na(is.flood)) %>%
+  left_join(DAT.floodgroup, by = "siteplot") %>%
+  mutate(floodgroup = as.integer(floodgroup),
+         siteplot = factor(siteplot, levels = siteplot.order$siteplot))
+         
+
+ggplot(data = dat.gg) + 
+  
+  geom_raster(aes(x = date, y = siteplot, fill = factor(is.flood * floodgroup))) +
+  
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  
+  scale_fill_manual(name = "Flood and group",
+                    breaks = 0:3,
+                    labels = c("dry", "flood grp 1", "flood grp 2", "flood grp 3"),
+                    values = c('grey90', '#1b9e77','#d95f02','#7570b3')) +
+  
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+
+gg_pdf(last_plot(), here("flood_history_groups.pdf"))
+
+```
+
+
+## Deal with missing data due to cloud cover
+
+We use the `mice` package to imupute flood occurrence in plots at times when cloud cover was high (missing data). The imputation process is repeated 400 times to give a set of possible, complete data sets.
+
+```{r}
+
+dat.mice <- DAT %>% 
+  select(siteplot, date, is.flood) %>% 
+  
+  # Fix column names that `mice` will choke on
+  mutate(siteplot = paste0("plot", str_replace(siteplot, "-", "_"))) %>% 
+  
+  # Reshape to a matrix of date (rows) by site-plot (cols)
+  tidyr::spread(siteplot, is.flood)
+
+
+# Do a total of 400 imputation using 5 cores
+mice.result <- parlmice(dat.mice, 
+                        cluster.seed = 42,
+                        n.core = 5,
+                        n.imp.core = 80,
+                        nprint = FALSE)
+
+mice.dats <- mice::complete(mice.result, action = "all")
+
+```
+
+
+Next, we combine the imputed data sets by expressing each cell (plot x time) value as the proportion of flood occurrences. Observed (non-missing) data will remain as either 1 or 0, while imputed values will be in the interval (0,1).
+
+```{r}
+
+# Step 1: sum values for all elements in colums 2:66 (column 1 is date)
+DAT.imputed <- Reduce(function(x, y) { cbind(date = x[,1], x[,-1] + y[,-1]) },
+                      mice.dats)
+
+# Step 2: express element values as proportions.
+DAT.imputed[, -1] <- DAT.imputed[, -1] / 400
+  
+```
+
+
+Finally, we classify the imputed data using the same metric and algorithm as with the original data.
+
+```{r}
+
+dat <- t(as.matrix(DAT.imputed[, -1]))
+rownames(dat) <- colnames(DAT.imputed)[-1]
+
+dat.d.imp <- vegan::vegdist(dat[, -(1:2)], method = "euclidean")
+
+dat.hc.imp <- hclust(dat.d, method = "ward.D2")
+plot(dat.hc.imp)
+
+```
+
+Compare classifications at the three group level.
+
+```{r}
+
+DAT.floodgroup.imp <- data.frame(
+  siteplot,
+  floodgroup = as.factor( cutree(dat.hc.imp, k = 3) )
+)
+
+table(DAT.floodgroup$floodgroup, DAT.floodgroup.imp$floodgroup)
+
+```
+
+The classifications of the original and imputed data are exactly the same. This should have been expected given how the imputation process works, ie. seeking relationships across objects in the data.
+
+
+## Check group flood grouping of plots within sites
+
+Because of the proximity of 9ha plots within any given site, we would expect them to be placed in the same flood group. Check if this is so by counting the number of flood groups per site:
+
+```{r}
+
+DAT.floodgroup %>%
+  group_by(site) %>%
+  summarize(ngrps = n_distinct(floodgroup)) %>%
+  filter(ngrps > 1)
+
+```
+
+Only site 21 has plots in more than one flood group:
+
+```{r}
+
+filter(DAT.floodgroup, site == 21)
+
+```
+
+Emma advises that there is no obvious difference in topography or context between plot 3 and the other two plots.
+
+Examining the nearest neighbours (dissimilarity of plot 3):
+
+```{r}
+
+# Nearest 5 neighbours
+i <- which(siteplot == "21-3")
+x <- as.matrix(dat.d)[i, ]
+x <- sort(x)
+head(x, 6)
+
+```
+
+The second and fourth nearest neighbours are the other two plots in site 21. Based on this we will manually move plot 21-3 into the same classification group as its sibling plots.
+
+```{r}
+
+i1 <- which(DAT.floodgroup$siteplot == "21-1")
+i3 <- which(DAT.floodgroup$siteplot == "21-3")
+
+DAT.floodgroup$floodgroup[i3] <- DAT.floodgroup$floodgroup[i1]
+
+```
+
+
+Re-do the ordination plot of flood groups.
+
+```{r}
+
+dat.mds$floodgroup <- DAT.floodgroup$floodgroup
+
+ggplot(data = dat.mds) +
+  geom_point(aes(x = mds1, y = mds2, colour = floodgroup),
+             size = 5, shape = 1) +
+  
+  coord_equal() +
+  
+  labs(title = "Sites positioned by MDS based on flood history")
+  
+```
+
+
+## Save flood group data to file
+
+```{r}
+
+DAT.floodgroup <- DAT.floodgroup %>%
+  select(siteplot, site, plot, floodgroup)
+
+save(DAT.floodgroup, file = here("data", "flood_group_boral.RData"))
+
+```
+

@@ -1,0 +1,294 @@
+---
+title: "Model sub-plot counts of stems per size class"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+
+library(runjags)
+runjags::load.runjagsmodule()
+
+set.seed(42)
+
+# Default graph theme - white background with
+# no grid lines
+theme_set( theme_bw() + theme(panel.grid = element_blank()) )
+
+
+# Load a set of helper functions
+source(file = here("scripts", "common_functions.R"))
+
+# Site and tree size information from RRGcommon package
+data(SITES, package = "RRGcommon")
+data(SIZES, package = "RRGcommon")
+
+
+REFIT_MODELS <- FALSE
+
+```
+
+
+## Summary
+
+Here, we develop a JAGS model of stem counts by size class within 9ha plots to integrate into the BORAL model of species composition. Fitting the BORAL model with MCMC samples of mean stem counts rather than pre-calculated fixed means (e.g. derived using 'bayesboot') accounts for variation in stem density between the replicate 0.1ha sub-plots within a plot.
+
+
+## Data
+
+Data are control and pre-thinning stem counts by size class for each 9ha plot.
+
+```{r}
+
+stems.dir <- here::here("..", "red_gum_thinning", "stem_densities")
+
+DAT.stems <- load_from( file.path(stems.dir, "data", "stems_complete.RData") )
+
+# Subset to control and pre-thinning plot data
+DAT.unthinned <- DAT.stems %>%
+  filter(survey %in% c("control", "pre.thinning")) %>%
+  left_join(select(SITES, site, plot, site.quality), by = c("site", "plot")) %>%
+  arrange(site, plot, subplot)
+
+
+```
+
+
+## Model
+
+We model stem counts as negative binomial values, implemented as a Gamma mixture of Poisson distributions. This representation allow priors to be related more easily to the means and standard deviations of stem counts.
+
+The model estimates mean stem count for each size class within each 9ha plot. Priors for size class means at the plot level are drawn from hyper-priors for each size class to impose some shrinkage across plots.
+
+### Model code
+
+```{r}
+
+modelTxt <- "model {
+  for (i in 1:length(nstems)) {
+    nstems[i] ~ dpois(mu[plot[i], sz[i]] * h[i])
+    h[i] ~ dgamma(theta[sz[i]], theta[sz[i]])
+  }
+
+  for (sz in 1:11) {
+    # Estimate dispersion independently for each size class
+    theta[sz] ~ dexp(1)
+
+    # Overall mean stems (log scale) for each size class
+    logmu.size[sz] ~ dnorm(0, 5)
+
+    sd.size[sz] ~ dunif(0, 5)
+    tau.size[sz] <- pow(sd.size[sz], -2)
+    
+    for (i in 1:66) {
+      logmu[i, sz] ~ dnorm(logmu.size[sz], tau.size[sz])
+      mu[i, sz] <- exp(logmu[i, sz])
+    }
+  }
+}"
+
+```
+
+
+### Model data
+
+```{r}
+
+dat.jags <- DAT.unthinned %>%
+  select(site, plot, site.quality, !!(SIZES$sizeclass)) %>%
+  
+  tidyr::gather(sizeclass, nstems, -c(site, plot, site.quality)) %>%
+  
+  filter(!is.na(nstems)) %>%
+  
+  mutate(plotindex = 3*(site-1) + plot,
+         sz = match(sizeclass, SIZES$sizeclass)) %>%
+  
+  select(plot = plotindex, sz, nstems)
+
+```
+
+
+### Run the model
+
+```{r}
+
+ModelPath <- here::here("models", "fitted", "jags_subplotstems_negbin.RData")
+
+if (REFIT_MODELS || !file.exists(ModelPath)) {
+  model <- run.jags(modelTxt,
+                    monitor = c("mu", "theta"),
+                    data = dat.jags,
+                    
+                    burnin = 4000,
+                    sample = 2000,
+                    thin = 30,
+                    n.chains = 4,
+                    
+                    method = "parallel",
+                    
+                    inits = function() {
+                      list(logmu = matrix(rlnorm(66 * 11), nrow=66),
+                           theta = rexp(11, 1))
+                    })
+  
+  save(model, file = ModelPath)
+  
+} else {
+  model <- load_from(ModelPath)
+}
+
+
+# Get a copy of the samples as a single chain
+post <- coda::as.mcmc( do.call(rbind, model$mcmc) )
+
+# Save median parameter values (plot x size means and size-specific dispersions)
+post.medians <- apply(post, MARGIN = 2, median)
+
+path <- here::here("models", "fitted", "jags_subplotstems_median_params.RData")
+save(post.medians, file = path)
+
+```
+
+
+Check model convergence.
+
+```{r}
+
+samples <- model$mcmc
+
+x <- coda::gelman.diag(samples)
+ii <- x$psrf[,1] > 1.1
+
+if (any(ii)) {
+  params <- rownames(x$psrf)[ii]
+  cat("Some parameters did not converge:\n", params)
+} else {
+  cat("All parameters converged\n")
+}
+
+```
+
+Check effective sample size for parameters.
+
+```{r}
+
+x <- coda::effectiveSize(post)
+ii <- x < 3000
+
+if (any(ii)) {
+  x[ii]
+}
+
+```
+
+The model has had most trouble fitting the smallest size class (most variable counts) and the dispersion parameters for the larger (most frequently absent) size classes. Still, we have plenty of samples to estimate median parameter values which will be the main use of this model.
+
+
+
+### Posterior predictive check
+
+The following graphs compare observed stem counts over size classes to the predicted mean count with 95% credible bounds for each 9ha plot.
+
+```{r}
+
+mucols <- str_detect(colnames(post), "^mu")
+
+dat.post <- as.data.frame(post[, mucols]) %>%
+  mutate(rep = row_number()) %>%
+  tidyr::gather(param, value, -rep) %>%
+  
+  mutate(
+    nums = str_extract(param, "\\d+\\,\\d+"),
+    plot = as.integer( str_extract(nums, "^\\d+") ),
+    sz = as.integer( str_extract(nums, "\\d+$") ) ) %>%
+  
+  select(-nums)
+
+
+dat.post.summary <- dat.post %>%
+  group_by(plot, sz) %>%
+  do({
+    q50 <- hpdi(.$value, 0.5)
+    q95 <- hpdi(.$value, 0.95)
+    mid <- median(.$value)
+    
+    data.frame(lwr95 = q95[1, "lower"],
+               lwr50 = q50[1, "lower"],
+               mid = mid,
+               upr50 = q50[1, "upper"],
+               upr95 = q95[1, "upper"])
+  }) %>%
+  
+  ungroup()
+
+
+facet.labels <- data.frame(
+  site = rep(1:22, each=3),
+  plot = rep(1:3, 22)
+)
+
+facet.labels <- facet.labels %>%
+  mutate(label = paste(site, plot, sep=":")) %>%
+  .$label
+
+names(facet.labels) <- 1:66
+
+
+plot_fn <- function(the.plots = 1:66) {
+  ggplot() +
+    geom_ribbon(data = filter(dat.post.summary, plot %in% the.plots),
+                aes(x = sz, ymin = lwr95, ymax = upr95),
+                fill = "blue", alpha = 0.4) +
+    
+    geom_line(data = filter(dat.post.summary, plot %in% the.plots),
+              aes(x = sz, y = mid),
+              size = 1, colour = "blue") +
+    
+    geom_jitter(data = filter(dat.jags, plot %in% the.plots),
+                aes(x = sz, y = nstems),
+                width = 0.1, height = 0,
+                size = 0.8, colour = "blue") +
+    
+    scale_x_continuous(breaks = seq(2, 10, 2)) +
+    
+    labs(x = "Size class", y = "Stems per 0.1ha subplot")
+}
+
+# Save a tall version for PDF - 6 plots (2 sites) per facet row
+ggsave(
+  plot = plot_fn(1:66) + 
+    facet_wrap(~ plot, scales = "free_y", 
+               labeller = as_labeller(facet.labels),
+               ncol = 6),
+  filename = "modelled_stem_counts.pdf",
+  width = 420, height = 594, units = "mm")
+
+```
+
+
+```{r}
+
+for (i in seq(1, 66, 6)) {
+  the.plots <- i:(i+5)
+  
+  print( plot_fn(the.plots) +
+           facet_wrap(~ plot, scales = "free_y", 
+               labeller = as_labeller(facet.labels))
+  )
+}
+
+```
+
+
+
+

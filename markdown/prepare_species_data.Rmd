@@ -1,0 +1,146 @@
+---
+title: "Prepare data to use for boral models"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(dplyr)
+library(readxl)
+library(stringr)
+
+source(file = here("scripts", "common_functions.R"))
+
+# Parallel folder with species data
+SPECIES_PATH <- here("..", "red_gum_thinning", "floristics_2015_2012", "data")
+
+# Parallel folder with stem density data
+STEM_PATH <- here("..", "red_gum_thinning", "stem_densities", "data")
+
+```
+
+## Species data
+
+Prepare species occurrence data for boral models by taking the data set used for previous RRG analyses (see project dir `floristics_2015_2012`) and removing all indeterminate taxa.
+
+### Identify indeterminates
+
+```{r}
+
+DAT <- load_from( file.path(SPECIES_PATH, "data_working_cover_2016.RData") )
+
+
+# Indeterminate species names can:
+# - start with 'Unknown' 
+# - end in 'spp.'
+# - contain the string 'indeterminate'
+#
+indets <- DAT %>%
+  filter(str_detect(tolower(workingname), 
+                    "(^unknown)|(spp\\.?$)|(indeterminate)")) %>%
+  
+  distinct(workingcode, workingname) %>%
+  arrange(workingname)
+
+cat(nrow(indets), "indeterminate taxa identified \n")
+
+knitr::kable(indets)
+
+```
+
+
+### Remove indeterminates
+
+```{r}
+
+DAT <- DAT %>%
+  anti_join(indets, by = "workingcode")
+  
+```
+
+
+### Remaining taxa
+
+```{r}
+
+SPECIES.summary <- DAT %>%
+  mutate(siteplot = paste0(site, "-", plot9ha)) %>%
+  group_by(workingcode) %>%
+  
+  summarize(workingname = first(workingname),
+            nsites = n_distinct(site),
+            nplots = n_distinct(siteplot),
+            nquadrats = n_distinct(sitenumber)) %>%
+  
+  arrange(workingname)
+
+
+knitr::kable(SPECIES.summary)
+
+```
+
+
+### Species information
+
+Species list with added fields for taxonomy, exotics and habitat. The original species info table was `floristics_2015_2012/data/species_working_2016.RData`. Here we use an updated table (extra habitat information) stored as an Excel file:
+
+```{r}
+
+# Join additional information for species
+spinfo <- read_excel( here("data_raw", "species_info.xlsx") )
+
+SPECIES.info <- SPECIES.summary %>%
+  select(workingcode, workingname) %>%
+  
+  left_join(
+    spinfo %>% select(workingcode, family, genus, species, weed, habitat = habitat_updated),
+    by = "workingcode"
+  )
+
+knitr::kable(SPECIES.info)
+
+```
+
+
+## Stem density data
+
+For stem density, we use estimates that were calculated for the project progress report in 2018. These give the per hectare density of each tree size class in each 9ha plot. The estimates were calculated using a Bayesian bootstrap procedure on the observed stem counts for ten 0.1ha hectare plots within each 9ha experimental plot.
+
+```{r}
+
+STEMS <- load_from( file.path(STEM_PATH, "stems_plot_estimates.RData") ) %>%
+  # Use the per hectare estimates for pre-thinning surveys
+  filter(survey %in% c("control", "pre.thinning")) %>%
+  select(site, plot, sizeclass, fitted.ha, lwr.ha, upr.ha)
+
+```
+
+Based on the fitted stem density values for individual size classes, we calculate summed stem area for each 9ha plot.
+
+```{r}
+
+STEMS.area <- STEMS %>%
+  group_by(site, plot) %>%
+  summarize(stemarea = sum( RRGcommon::calculate_stem_area(sizeclass, fitted.ha) ) )
+
+```
+
+
+## Save data to file
+
+```{r}
+
+save(DAT, file = here("data", "site_species_boral.RData"))
+
+save(SPECIES.summary, file = here("data", "species_summary_boral.RData"))
+save(SPECIES.info, file = here("data", "species_info_boral.RData"))
+
+save(STEMS, file = here("data", "stem_density_boral.RData"))
+save(STEMS.area, file = here("data", "stem_area_boral.RData"))
+
+```
+

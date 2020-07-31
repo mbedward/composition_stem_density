@@ -1,0 +1,866 @@
+---
+title: "BORAL models of composition versus RRG stem density"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+
+library(rjags)
+load.module("glm")
+
+library(boral)
+library(ggboral)
+
+library(dplyr)
+library(ggplot2)
+library(latex2exp)
+library(readxl)
+library(stringr)
+library(tidyr)
+
+# local package
+data(SITES, package = "RRGcommon")
+
+# Random number seed
+set.seed(42)
+
+# Set this to TRUE to force re-fitting of models if
+# cached objects exist. Set to FALSE to use cached outputs.
+REFIT_MODELS <- FALSE
+
+# Set this to TRUE to save graphs to file with the gg_pdf function (below).
+SAVE_GRAPHS <- TRUE
+
+# Default theme for graphs
+theme_set( theme_bw() )
+
+
+# Load common functions
+source(file = here("scripts", "common_functions.R"))
+
+# Size class look-up table
+data(SIZES, package = "RRGcommon")
+
+```
+
+
+## Data
+
+Response data is a matrix of species occurrences within 9ha experimental plots. The data for each plot are formed by pooling records from the three floristics quadrats located within the plot.
+
+```{r}
+
+DAT.occurrence.long <- load_from( here("data", "site_species_boral.RData") ) %>%
+  
+  mutate(siteplot = paste0(site, "-", plot9ha)) %>%
+  
+  distinct(site, plot9ha, siteplot, workingcode)
+
+```
+
+
+Coding, name and habitat information for species.
+
+```{r}
+
+SPECIES.info <- load_from( here("data", "species_info_boral.RData") )
+
+```
+
+
+Summary of species prevalence in sites, plots and quadrats.
+
+```{r}
+
+SPECIES.summary <- load_from( here("data", "species_summary_boral.RData") )
+
+```
+
+
+Stem density estimates.
+
+```{r}
+
+STEMS <- load_from( here("data", "stem_density_boral.RData") )
+STEMS.area <- load_from( here("data", "stem_area_boral.RData") )
+
+```
+
+
+Flood history plot groupings.
+
+```{r}
+
+DAT.floodgroup <- load_from( here("data", "flood_group_boral.RData") )
+
+```
+
+
+### Identify a subset of species for modelling
+
+Of the 200 species identified as candidates for modelling, 84 were only recorded in 1 or 2 experimental plots (most of the latter being in a single site). 
+
+The threshold number of occurrences set to include a species for modelling is hard to define, but given the complexity of the models to be fitted, a minimum of 5 plot occurrences is a reasonable starting point.
+
+We also remove Eucalpytus camaldulensis (present in all sites) from the data set.
+
+```{r}
+
+SpeciesSubset <- SPECIES.summary %>%
+  filter(nplots >= 5) %>%
+  
+  left_join(SPECIES.info, by = c("workingcode", "workingname")) %>%
+  
+  # remove red gums
+  filter(workingname != "Eucalyptus camaldulensis")
+
+cat("Subset with", nrow(SpeciesSubset), "taxa", 
+    "of which", sum(SpeciesSubset$weed), "are exotic \n")
+
+```
+
+### Response data matrix for boral
+
+```{r}
+
+DAT.occurrence.subset <- DAT.occurrence.long %>%
+  filter(workingcode %in% SpeciesSubset$workingcode)
+
+# Format response data as a matrix for boral
+M.y <- DAT.occurrence.subset %>%
+  mutate(present = 1) %>%
+  tidyr::spread(workingcode, present, fill=0) %>%
+  
+  # Order should be fine but just in case...
+  arrange(site, plot9ha)
+
+
+SiteLookup <- M.y %>%
+  select(site, plot = plot9ha, siteplot) %>%
+  left_join(
+    SITES %>% select(site, plot, site.quality),
+    by = c("site", "plot")
+  ) %>%
+  
+  left_join(DAT.floodgroup, by = c("site", "plot", "siteplot"))
+
+
+M.y <- as.matrix(M.y[ , -(1:3)])
+rownames(M.y) <- SiteLookup$siteplot
+
+```
+
+
+## Model 1 - Unconstrained
+
+The first model is fitted with no explanatory variables, two latent variables, and a random effect at the plot level.
+
+```{r}
+
+Path.model1 <- here("models/fitted/model1.RData")
+
+if (REFIT_MODELS || !file.exists(Path.model1)) {
+  
+  model1 <- boral.default(
+    y = M.y, X = NULL, 
+    family = "binomial", 
+    
+    lv.control = list(num.lv = 2), 
+    row.eff = "random", row.ids = as.matrix(1:66), 
+    
+    save.model = TRUE,
+    model.name = here("models/boral_model1.jags"),
+    
+    mcmc.control = list(
+      n.burnin = 10e3,
+      n.iteration = 110e3,
+      thin = 25
+    )
+  )
+  
+  cat("Geweke convergence check (prop exceeded):", model1$geweke.diag$prop.exceed[2])
+  
+  save(model1, file = Path.model1)
+  
+} else {
+  model1 <- load_from(Path.model1)
+}
+
+```
+
+
+### Latent variable graph
+
+Latent variables in relation to site quality classes.
+
+```{r}
+
+dat.gg <- gg_lvsplot_data(model1) %>%
+
+  # only keep records for sites (objects)
+  filter(var == "lv") %>%
+
+  # Add site information
+  left_join(SiteLookup, by = c("label" = "siteplot"))
+  
+
+gg.model1.lv.sitequality <- ggplot(data = dat.gg, aes(x = lv1, y = lv2)) +
+  geom_point(aes(colour = site.quality),
+             shape = 16, size = 5, alpha = 0.2) +
+  
+  geom_text(aes(colour = site.quality, label = site)) +
+  
+  stat_chull(aes(colour = site.quality), fill = NA) +
+  
+  scale_colour_discrete(name = "Site quality") +
+
+  coord_equal() +
+  
+  labs(x = "Latent variable 1", 
+       y = "Latent variable 2",
+       title = "Unconstrained model: LVs related to site quality") +
+  
+  theme(legend.position = "top")
+
+print(gg.model1.lv.sitequality)
+
+gg_pdf(gg.model1.lv.sitequality, 
+       file = here("models/outputs/model1_lv_sitequality.pdf"))
+
+```
+
+Relationship to flood history groups.
+
+```{r}
+
+gg.model1.lv.flood <- ggplot(data = dat.gg, aes(x = lv1, y = lv2)) +
+  geom_point(aes(colour = floodgroup),
+             shape = 16, size = 5, alpha = 0.2) +
+  
+  geom_text(aes(colour = floodgroup, label = site)) +
+  
+  stat_chull(aes(colour = floodgroup), fill = NA) +
+  
+  scale_colour_discrete(name = "Flood group") +
+  
+  coord_equal() +
+  
+  labs(x = "Latent variable 1", 
+       y = "Latent variable 2",
+       title = "Unconstrained model: LVs related to flood history groups") +
+  
+  theme(legend.position = "top")
+
+
+print(gg.model1.lv.flood)
+
+
+gg_pdf(gg.model1.lv.flood, 
+       file = here("models/outputs/model1_lv_floodgroup.pdf"))
+
+```
+
+## Model 2 - Flood groups
+
+```{r}
+
+Path.model2 <- here("models/fitted/model2.RData")
+
+# Dummy variable coding for floodgroup
+X <- model.matrix(~ floodgroup, data = SiteLookup)
+
+# remove intercept term
+X <- X[, -1, drop=FALSE]
+
+if (REFIT_MODELS || !file.exists(Path.model2)) {
+  
+  model2 <- boral.default(
+    y = M.y, 
+    X = X, 
+    family = "binomial", 
+    
+    lv.control = list(num.lv = 2), 
+    row.eff = "random", row.ids = as.matrix(1:66), 
+    
+    save.model = TRUE,
+    model.name = here("models/boral_model2.jags"),
+    
+    mcmc.control = list(
+      n.burnin = 10e3,
+      n.iteration = 110e3,
+      thin = 25
+    )
+  )
+  
+  cat("Geweke convergence check (prop exceeded):", model2$geweke.diag$prop.exceed[2])
+  
+  save(model2, file = Path.model2)
+  
+} else {
+  model2 <- load_from(Path.model2)
+}
+
+```
+
+
+### Latent variable graph
+
+Latent variables in relation to site quality classes.
+
+```{r}
+
+dat.gg <- gg_lvsplot_data(model2) %>%
+
+  # only keep records for sites (objects)
+  filter(var == "lv") %>%
+
+  # Add site information
+  left_join(SiteLookup, by = c("label" = "siteplot"))
+
+
+gg.model2.lv.sitequality <- ggplot(data = dat.gg, aes(x = lv1, y = lv2)) +
+  geom_point(aes(colour = site.quality),
+             shape = 16, size = 5, alpha = 0.2) +
+  
+  geom_text(aes(colour = site.quality, label = site)) +
+  
+  stat_chull(aes(colour = site.quality), fill = NA) +
+  
+  scale_colour_discrete(name = "Site quality") +
+
+  coord_equal() +
+  
+  labs(x = "Latent variable 1", 
+       y = "Latent variable 2",
+       title = "Flood group model: LVs related to site quality") +
+  
+  theme(legend.position = "top")
+
+print(gg.model2.lv.sitequality)
+
+gg_pdf(gg.model2.lv.sitequality, 
+       file = here("models/outputs/model2_lv_sitequality.pdf"))
+
+```
+
+
+Relationship to flood history groups.
+
+```{r}
+
+gg.model2.lv.flood <- ggplot(data = dat.gg, aes(x = lv1, y = lv2)) +
+  geom_point(aes(colour = floodgroup),
+             shape = 16, size = 5, alpha = 0.2) +
+  
+  geom_text(aes(colour = floodgroup, label = site)) +
+  
+  stat_chull(aes(colour = floodgroup), fill = NA) +
+  
+  scale_colour_discrete(name = "Flood group") +
+  
+  coord_equal() +
+  
+  labs(x = "Latent variable 1", 
+       y = "Latent variable 2",
+       title = "Flood group model: LVs related to flood history groups") +
+  
+  theme(legend.position = "top")
+
+
+print(gg.model2.lv.flood)
+
+
+gg_pdf(gg.model2.lv.flood, 
+       file = here("models/outputs/model2_lv_floodgroup.pdf"))
+
+```
+
+
+With the addition of flood group as a predictor, there is less structure of site positions in latent variable space.
+
+```{r}
+
+lim <- ggplot2::lims(x = c(-3,3), y = c(-3,3))
+
+g <- gridExtra::grid.arrange(
+  gg.model1.lv.flood + labs(title = "model 1") + lim, 
+  gg.model2.lv.flood + labs(title = "model 2") + lim,
+  ncol = 2
+)
+
+gg_pdf(plot = g, file = here("models/outputs/model2vs1_lv.pdf"))
+
+```
+
+
+### Variance partitioning
+
+For each species, we estimate the relative proportion of variance accounted for by predictors (flood group), plot-level random effect, and latent variables.
+
+```{r fig.height=8}
+
+dat.gg <- gg_varpart_data(model2) %>%
+  
+  left_join(SPECIES.info %>% mutate(workingcode = as.character(workingcode)), 
+             by = c("label" = "workingcode"))
+
+# arrange names in order of variance accounted for by predictor
+name.order <- dat.gg %>%
+  filter(varpart == "X") %>%
+  arrange(value) %>%
+  mutate(name.habitat = sprintf("%s (%s)", workingname, habitat)) %>%
+  select(workingname, name.habitat)
+           
+
+dat.gg <- dat.gg %>%
+  mutate(label = factor(workingname, 
+                        levels = name.order$workingname, 
+                        labels = name.order$name.habitat))
+
+gg.model2.varpart <- ggplot(data = dat.gg) +
+  geom_bar(aes(x = label, y = value, fill = varpart),
+             stat = "identity", width = 0.5, alpha = 0.6) +
+
+    scale_fill_viridis_d(name = "Variance component",
+                         breaks = c("X", "row", "lv"),
+                         labels = c("Predictors", "Row effects", "Latent variables"),
+                         begin = 0, end = 0.8, direction = -1) +
+
+    labs(x = "", y = "Proportion of variance") +
+
+    coord_flip() +
+
+    theme(legend.position = "right")
+
+
+print(gg.model2.varpart)
+
+
+gg_pdf(gg.model2.varpart, 
+       size = pagesize("A3", "portrait", "cm"),
+       filename = here("models/outputs/model2_varpart.pdf"))
+
+```
+
+
+## Model 3 - Effect of stem density
+
+Here we add predictors for stem counts within the following tree diameter classes:
+
+  * stems <10cm
+  * stems 10-20cm
+  * stems 20-30cm
+  * stems 30-40cm
+  * stems 40-80cm
+  * stems >= 80cm
+
+Count data for each 9ha plot are pre-thinning mean values derived from ten 0.1ha sub-plot counts using Bayesian bootstrap.
+
+```{r}
+
+SizeClasses <- c("less10cm", "from10to20cm", "from20to30cm", 
+                   "from30to40cm", "from40to80cm", "from80cm")
+
+X.stems <- STEMS %>%
+  select(site, plot, sizeclass, fitted.ha) %>%
+  tidyr::spread(sizeclass, fitted.ha) %>%
+  
+  mutate(from40to80cm = from40to50cm + from50to60cm + from60to70cm + from70to80cm,
+         from80cm = from80to90cm + from90to100cm + from100plus) %>%
+  
+  # ensure correct order of records
+  arrange(site, plot) %>%
+  
+  # standardize estimated means within size classes
+  select(!!SizeClasses) %>%
+  scale()
+
+```
+
+
+Fit the model.
+
+```{r}
+
+Path.model3 <- here("models/fitted/model3.RData")
+
+# Dummy variable coding for floodgroup
+X.flood <- model.matrix(~ floodgroup, data = SiteLookup)
+
+# remove intercept term
+X.flood <- X.flood[, -1, drop=FALSE]
+
+# Add standardized stem data
+X <- cbind(X.flood, X.stems)
+
+# SSVS index vector: 0 means include for SSVS; -1 means exclude
+ssvs.index <- ifelse(str_detect(colnames(X), "flood"), -1, 0)
+
+if (REFIT_MODELS || !file.exists(Path.model3)) {
+  
+  model3 <- boral(
+    y = M.y, 
+    X = X, 
+    family = "binomial",
+    
+    lv.control = list(num.lv = 2), 
+    
+    row.eff = "random",
+    row.ids = as.matrix(1:66), 
+
+    save.model = TRUE,
+    model.name = here("models/boral_model3.jags"),
+    
+    # Apply SSVS to all count variables but not site quality
+    prior.control = list(ssvs.index = ssvs.index),
+    
+    mcmc.control = list(
+      n.burnin = 10e3,
+      n.iteration = 110e3,
+      thin = 25
+    )
+  )
+  
+  cat("Geweke convergence check (prop exceeded):", model3$geweke.diag$prop.exceed[2])
+  
+  save(model3, file = Path.model3)
+  
+} else {
+  model3 <- load_from(Path.model3)
+}
+
+```
+
+### Variable inclusion rates
+
+For this model, the returned boral object includes the posterior means for SSVS indicator variables. At each MCMC iteration, each species is assigned a vector of variables indicating which tree size classes are included (indicator = 1) or excluded (indicator = 0) for the probit regression of species occurrences. The posterior mean values for the indicator variables over all model interations can be interpreted as probabilities of inclusion of the size class variables for each species.
+
+Here we visualize the inclusion rates as a heatmap-style graph.
+
+```{r}
+
+dat <- model3$ssvs.indcoefs.mean
+
+# There are only indicators for size class variables, not site quality
+ii <- !str_detect(colnames(dat), "flood")
+dat <- dat[, ii]
+dat <- round(dat, digits = 2)
+
+# Set sign of the indicator means based on sign of fitted coefficients.
+# Use mean value because median coef will be zero when inclusion rate is less than 0.5
+x <- model3$X.coefs.mean[, ii]  
+x <- round(x, digits = 1)
+x <- sign(x)
+
+dat <- dat * x
+
+# Add species info to data
+dat <- dat %>%
+  as.data.frame() %>%
+  mutate(species = as.integer(str_extract(rownames(.), "\\d+"))) %>%
+  
+  left_join(SpeciesSubset, by = c("species" = "workingcode"))
+
+
+# Cluster species based on their vectors of sizeclass variable inclusion rates.
+# Do this separately for native and exotic species
+x <- dat %>%
+  group_by(weed) %>%
+  do (
+    {
+      n <- nrow(.)
+      d <- dist(.[, SizeClasses])  # euclidean distance
+      h <- hclust(d, method = "complete")
+      data.frame(species = .$species[h$order], rank = 1:n)
+    }
+  )
+
+dat <- left_join(dat, x, by = c("species", "weed"))
+
+# Re-order data based on dendrogram order within exotic/native
+dat <- arrange(dat, weed, rank)
+
+# Record order of species names to use as factor levels for ggplot
+levels <- dat %>%
+  select(workingname)
+
+# Convert data to long format for ggplot
+dat <- dat %>%
+  tidyr::gather(sizeclass, indmean, SizeClasses) %>%
+  mutate(sizeclass = factor(sizeclass, levels = SizeClasses),
+         status = ifelse(is.na(weed), "Indet", ifelse(weed, "Exotic", "Native")),
+         workingname = factor(workingname, levels = levels$workingname))
+
+
+# Graph native and exotic species in separate facets. Note that we use
+# facet_grid with space = 'free_y' to get uniform row heights.
+
+dat <- filter(dat, status %in% c("Exotic", "Native"))
+
+
+gg.model3.inclusion <- ggplot(data = dat) +
+  geom_raster(aes(x = sizeclass, y = workingname, fill = indmean)) +
+  
+  scale_fill_gradient2(name = "Inclusion rate",
+                       low = "#7b3294", mid = "white", high = "#008837") +
+  
+  labs(x = "Size class", y = "Species",
+       title = "Rates of inclusion of size class variables for each species") +
+  
+  facet_grid(status ~ ., scales = "free_y", space = "free_y")
+
+
+print(gg.model3.inclusion)
+
+
+gg_pdf(plot = gg.model3.inclusion, 
+       file = here("models/outputs/model3_ssvs.pdf"), 
+       size = pagesize("A3"))
+
+```
+
+### Variance partitioning
+
+For each species, we estimate the relative proportion of variance accounted for by predictors (flood group), plot-level random effect, and latent variables.
+
+TODO: check if this is valid to do when we have used SSVS in boral.
+
+```{r fig.height=8}
+
+dat.gg <- gg_varpart_data(model3) %>%
+  
+  left_join(SPECIES.info %>% mutate(workingcode = as.character(workingcode)), 
+             by = c("label" = "workingcode"))
+
+# arrange names in order of variance accounted for by predictor
+name.order <- dat.gg %>%
+  filter(varpart == "X") %>%
+  arrange(value) %>%
+  mutate(name.habitat = sprintf("%s (%s)", workingname, habitat)) %>%
+  select(workingname, name.habitat)
+           
+
+dat.gg <- dat.gg %>%
+  mutate(label = factor(workingname, 
+                        levels = name.order$workingname, 
+                        labels = name.order$name.habitat))
+
+gg.model3.varpart <- ggplot(data = dat.gg) +
+  geom_bar(aes(x = label, y = value, fill = varpart),
+             stat = "identity", width = 0.5, alpha = 0.6) +
+
+    scale_fill_viridis_d(name = "Variance component",
+                         breaks = c("X", "row", "lv"),
+                         labels = c("Predictors", "Row effects", "Latent variables"),
+                         begin = 0, end = 0.8, direction = -1) +
+
+    labs(x = "", y = "Proportion of variance") +
+
+    coord_flip() +
+
+    theme(legend.position = "right")
+
+
+print(gg.model3.varpart)
+
+
+gg_pdf(gg.model3.varpart, 
+       size = pagesize("A3"),
+       filename = here("models/outputs/model3_varpart.pdf"))
+
+```
+
+
+## Model 4 - Fixed stem density estimates and Laplace priors
+
+As a fall-back, we fit a basic model following the form of BORAL model 3 (Bayesian bootstrap stem density estimates plus flood groups) but using density estimates from the JAGS stems model and replacing SSVS priors on species coefficients with Laplace priors.
+
+### Model code
+
+Note: This model assumes mean stem density by size values have been pre-grouped into six size classes: <10, 10-20, 20-30, 30-40, 40-80, >=80
+
+```{r}
+
+model4.Code <- "model {
+  # Model species occurrence
+  for(i in 1:nplots) {
+    for(j in 1:nspecies) { 
+      eta[i,j] <- inprod(lv.coefs[j,2:(num.lv+1)],lvs[i,]) + 
+        row.coefs.ID1[i] + 
+        flood.coefs[j, floodgroup[i]] +
+        inprod(stem.coefs[j,], mu.stems.std[i,])
+    
+      Z[i,j] ~ dnorm(lv.coefs[j,1] + eta[i,j], 1)
+      y[i,j] ~ dbern(step(Z[i,j]))
+    }
+  }
+  
+  ## Latent variables ##
+  for(i in 1:nplots) { for(k in 1:num.lv) { lvs[i,k] ~ dnorm(0,1) } } 
+  
+  ## Process level and priors ##
+  for(j in 1:nspecies) { lv.coefs[j,1] ~ dnorm(0,0.1) } ## Separate species intercepts
+  
+  for(i in 1:nplots) { 
+    row.coefs.ID1[i] ~ dnorm(0, pow(row.sigma.ID1,-2)) 
+  } 
+  row.sigma.ID1 ~ dunif(0, 30)
+  
+  for(i in 1:(num.lv-1)) { 
+    for(j in (i+2):(num.lv+1)) {
+      # Constraints to 0 on upper diagonal
+      lv.coefs[i,j] <- 0 
+    } 
+  }
+  
+  for(i in 1:num.lv) { 
+     # Sign constraints on diagonal elements
+    lv.coefs[i,i+1] ~ dnorm(0,0.1)I(0,) 
+  }
+  
+  for(i in 2:num.lv) { 
+    for(j in 2:i) { 
+      # Free lower diagonals
+      lv.coefs[i,j] ~ dnorm(0,0.1) 
+    } 
+  }
+  
+  for(i in (num.lv+1):nspecies) { 
+    for(j in 2:(num.lv+1)) { 
+      # All other elements
+      lv.coefs[i,j] ~ dnorm(0,0.1)
+    } 
+  }
+  
+
+  # species coefficients on flood group and stem density
+  # drawn from Laplace priors with variance equal to that of 
+  # the boral default priors (10).
+
+  laplace.scale <- sqrt(2 / 10)
+  for(j in 1:nspecies) { 
+    # coefficient on flood group
+    for (kflood in 1:3) {
+      flood.coefs[j, kflood] ~ ddexp(0, laplace.scale) 
+    }
+
+    for (ksize in 1:6) {
+      stem.coefs[j,ksize] ~ ddexp(0, laplace.scale)
+    }
+  }
+}"
+
+```
+
+
+### Data for model
+
+```{r}
+
+# Stem count values are median estimates of negative binomial means
+# from a previously fitted stems model (see model_subplot_stems_JAGS.Rmd).
+# Object is a named vector.
+
+stem.params <- load_from(
+  here::here("models", "fitted", "jags_subplotstems_median_params.RData") )
+
+# Arrange negbin means as a matrix with plots as rows and aggregated size 
+# classes as cols
+#
+mu.stems <- data.frame(param = names(stem.params), value = stem.params) %>%
+  dplyr::filter(str_detect(param, "^mu")) %>%
+  
+  mutate(nums = str_extract(param, "\\d+\\,\\d+"),
+         plot = as.integer(str_extract(nums, "^\\d+")),
+         sz = as.integer(str_extract(nums, "\\d+$"))) %>%
+  
+  dplyr::select(plot, sz, value) %>%
+  
+  # Aggregate size classes into aggregate groups for modelling
+  mutate(szgrp = ifelse(sz <= 4, sz, ifelse(sz <= 8, 5, 6))) %>%
+  group_by(plot, szgrp) %>%
+  summarize(value = sum(value)) %>%
+  ungroup() %>%
+  
+  tidyr::spread(szgrp, value) %>%
+  
+  select(-plot) %>%
+  as.matrix()
+
+colnames(mu.stems) <- SizeClasses
+
+
+model4.data <- list(
+  y = M.y,
+  
+  floodgroup = SiteLookup$floodgroup,
+  
+  # Pass stem counts as standardized values
+  mu.stems.std = scale(mu.stems),
+
+  nplots = nrow(M.y),
+  nspecies = ncol(M.y),
+  
+  num.lv = 2
+)
+
+```
+
+
+### Compile and run the model
+
+```{r}
+
+# Note fn_Zinit is defined above for model 3A
+
+model4 <- R2jags::jags(
+  data = model4.data, 
+  inits = list(list(Z = fn_Zinit(M.y))), 
+  parameters.to.save = c("flood.coefs",
+                         "lvs", "lv.coefs", 
+                         "row.coefs.ID1",
+                         "row.sigma.ID1",
+                         "stem.coefs"), 
+  model.file = textConnection(model4.Code),
+  n.chains = 1, 
+  n.iter = 11000, 
+  n.burnin = 1000, 
+  n.thin = 1)
+
+model4.samples <- coda::mcmc(model4$BUGSoutput$sims.matrix, start = 1, thin = 1)
+
+```
+
+
+### Check model convergence and effective sample sizes
+
+Geweke's diagnostic for model convergence.
+
+```{r}
+
+g <- coda::geweke.diag(model4.samples)
+ok <- (2 * pnorm(abs(g$z), lower.tail = FALSE) > 0.05)
+p <- sum(ok, na.rm = TRUE) / length(na.omit(ok))
+
+cat(round(p * 100, 2), "percent of parameters converged")
+
+```
+
+Check for parameters with less than 4000 effectively independent samples. Note, there will always be two with zero samples: deviance (calculated) and lv.coefs[1,3] (fixed at zero).
+
+```{r}
+
+x <- coda::effectiveSize(model4.samples)
+ii <- x < 4000
+
+if (sum(ii) > 2) {
+  cat(sum(ii) - 2, "free parameters with less than 4000 samples\n")
+} else {
+  cat("All free parameters have at least 4000 samples")
+}
+
+```
+

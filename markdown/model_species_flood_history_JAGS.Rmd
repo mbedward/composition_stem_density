@@ -1,0 +1,543 @@
+---
+title: "Model species occurrence in relation to flood frequency and timing"
+output:
+  word_document: 
+    fig_height: 6
+    fig_width: 8
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+
+library(runjags)
+runjags::load.runjagsmodule()
+
+set.seed(42)
+
+# Default graph theme - white background with
+# no grid lines
+theme_set( theme_bw() + theme(panel.grid = element_blank()) )
+
+
+# Load a set of helper functions
+source(file = here("scripts", "common_functions.R"))
+
+# Site information from RRGcommon package
+data(SITES, package = "RRGcommon")
+
+
+REFIT_MODELS <- FALSE
+
+```
+
+
+## Summary
+
+Here, we develop a JAGS model of species occurrence within 9ha plots in relation to flood frequency. The aim is to integrate this as a sub-model into the working BORAL model of species composition in relation to flood history and tree stem density. We will compare this model to one that relates species occurrence to flood groups derived from a hierarchical classification of plots.
+
+We also tried modelling species occurrence with a predictor based on a function of both flood frequency and timing with effects decaying exponentially over time. However we abandoned this because (a) it was difficult to get the model to converge; and (b) the predictor function values turned out to be little more than linear transformations of flood frequency.
+
+
+## Data
+
+### Species occurrence
+
+Response data is a matrix of species occurrences within 9ha experimental plots. The data for each plot are formed by pooling records from the three floristics quadrats located within the plot.
+
+```{r}
+
+DAT.occurrence.long <- load_from( here("data", "site_species_boral.RData") ) %>%
+  
+  mutate(siteplot = paste0(site, "-", plot9ha)) %>%
+  
+  distinct(site, plot9ha, siteplot, workingcode)
+
+```
+
+
+Coding, name and habitat information for species.
+
+```{r}
+
+SPECIES.info <- load_from( here("data", "species_info_boral.RData") )
+
+```
+
+
+Summary of species prevalence in sites, plots and quadrats.
+
+```{r}
+
+SPECIES.summary <- load_from( here("data", "species_summary_boral.RData") )
+
+```
+
+
+Of the 200 species identified as candidates for modelling, 84 were only recorded in 1 or 2 experimental plots (most of the latter being in a single site). 
+
+The threshold number of occurrences set to include a species for modelling is hard to define, but given the complexity of the models to be fitted, a minimum of 5 plot occurrences is a reasonable starting point.
+
+We also remove Eucalpytus camaldulensis (present in all sites) from the data set.
+
+```{r}
+
+SpeciesSubset <- SPECIES.summary %>%
+  filter(nplots >= 5) %>%
+  
+  left_join(SPECIES.info, by = c("workingcode", "workingname")) %>%
+  
+  # remove red gums
+  filter(workingname != "Eucalyptus camaldulensis")
+
+cat("Subset with", nrow(SpeciesSubset), "taxa", 
+    "of which", sum(SpeciesSubset$weed), "are exotic \n")
+
+```
+
+
+Response data matrix for modelling
+
+```{r}
+
+DAT.occurrence.subset <- DAT.occurrence.long %>%
+  filter(workingcode %in% SpeciesSubset$workingcode)
+
+# Format response data as a matrix for boral
+M.y <- DAT.occurrence.subset %>%
+  mutate(present = 1) %>%
+  tidyr::spread(workingcode, present, fill=0) %>%
+  
+  # Order should be fine but just in case...
+  arrange(site, plot9ha)
+
+
+SiteLookup <- M.y %>%
+  select(site, plot = plot9ha, siteplot)
+
+
+M.y <- as.matrix(M.y[ , -(1:3)])
+rownames(M.y) <- SiteLookup$siteplot
+
+```
+
+
+Species groups based on habitat. Because most of the wet / moist habitat types are sparsely represented we will lump them into two groups: wet and terrestrial.
+
+```{r}
+
+SpeciesSubset <- SpeciesSubset %>%
+  mutate(model.group = ifelse(habitat == "terrestrial", 1, 2))
+
+```
+
+
+### Flood times for each site
+
+```{r}
+
+path <- here("data", "inundation.RData")
+
+DAT.flood <- load_from(path) %>%
+  mutate(date = as.Date(date),
+         
+         siteplot = paste0(site, "-", plot),
+         siteplot = factor(siteplot, levels = paste0(rep(1:22, each=3), "-", 1:3)),
+         isiteplot = as.integer(siteplot),
+         
+         date = as.Date(date),
+         weeks.ago = as.numeric(max(date, na.rm = TRUE) - date, "weeks"),
+         
+         p.flood = ifelse(prop.cloudfree > 0.25, prop.inundated, NA) ) %>%
+  
+  select(site, plot, siteplot, isiteplot,
+         date, weeks.ago, 
+         p.flood, 
+         p.cloud = prop.cloudfree) %>%
+  
+  mutate(p.cloud = 1 - p.cloud) %>%
+  
+  arrange(site, plot, date)
+
+
+# Construct a matrix with siteplots as rows and floods as columns. 
+# Values are time of flood (weeks ago).
+# Different plots have different numbers of floods so we pad rows with
+# NA values as required. The model can then use the matrix as a
+# ragged array.
+
+dat <- DAT.flood %>%
+  dplyr::filter(!is.na(p.flood), p.flood > 0) %>%
+  arrange(isiteplot, weeks.ago)
+
+dat.nfloods <- dat %>%
+  group_by(siteplot, site, plot) %>%
+  summarize(N = n()) %>%
+  ungroup() %>%
+  
+  # flood frequency as proportion of max
+  mutate(Np = N / max(N))
+
+```
+
+
+```{r}
+
+hist(dat.nfloods$N, main = "Number of floods over 30 years per 9ha plot")
+
+```
+
+
+## JAGS model
+
+The model relates the probability of occurrence of a species in a plot to its general distribution (species intercept), flood frequency in the plot, and a random plot effect. Species coefficients for flood frequency are drawn from group-level distributions for terrestrial versus moist / wet / aquatic species.
+
+### Model code
+
+```{r}
+
+modelTxt <- "model {
+  for (i in 1:nplots) {
+    for (j in 1:nspp) {
+      y[i,j] ~ dbern(p[i,j])
+
+      # logit(p) = species intercept + flood effect + site effect
+      logit(p[i,j]) <- b0[j] + b1[j] * flooding[i] + z[i]
+    }
+  }
+
+  
+  # Priors for species intercepts
+  for (j in 1:nspp) {
+    b0[j] ~ dnorm(0, 0.1)
+  }
+
+  # Priors for flood effects, with species coefficients drawn
+  # from distributions at the group (habitat) level.
+  for (j in 1:nspp) {
+    b1[j] ~ dnorm(mu.grp[spgroup[j]], 1)
+  }
+  for (k in 1:nspgroups) { mu.grp[k] ~ dnorm(0, 0.1) }
+
+  # Priors for site random effect with standard deviation 
+  # estimated from data.
+  for (i in 1:nplots) {
+    z[i] ~ dnorm(0, z.tau)
+  }
+  z.sd ~ dexp(1)
+  z.tau <- z.sd^(-2)
+}
+"
+
+```
+
+
+### Model data
+
+```{r}
+
+jags.data <- list(
+  nplots = nrow(M.y),
+  nspp = ncol(M.y),
+  nspgroups = 2,
+  
+  y = M.y,
+  spgroup = SpeciesSubset$model.group,
+  
+  flooding = dat.nfloods$Np
+)
+
+```
+
+
+### Run the model
+
+```{r}
+
+ModelPath <- here::here("models", "fitted", "jags_species_flood.RData")
+
+if (REFIT_MODELS || !file.exists(ModelPath)) {
+  model <- run.jags(modelTxt,
+                    monitor = c("b0", "b1", "mu.grp", "z.sd"),
+                    data = jags.data,
+                    
+                    burnin = 4000,
+                    sample = 1000,
+                    thin = 20,
+                    n.chains = 4,
+                    
+                    method = "parallel")
+  
+  save(model, file = ModelPath)
+  
+} else {
+  model <- load_from(ModelPath)
+}
+
+```
+
+### Check model convergence
+
+```{r}
+
+x <- summary(model)
+
+par(mfrow = c(1,2))
+
+# Gelman-Rubin comparison of chains
+hist(x[, "psrf"], main = "Gelman-Rubin")
+
+# Number of effectively independent samples
+hist(x[, "SSeff"], main = "Effective samples")
+
+```
+
+### Matrix of posterior samples
+
+```{r}
+
+samples <- do.call(rbind, model$mcmc)
+
+```
+
+
+
+## Model results
+
+### Group level response to flood frequency
+
+The graph below shows the posterior distribution of the group-level means for coefficient on flood frequency for terrestrial and wet species.
+
+```{r}
+
+dat.gg <- as.data.frame( samples[, c("mu.grp[1]", "mu.grp[2]")] )
+colnames(dat.gg) <- c("terrestrial", "moist-wet")
+
+dat.gg <- dat.gg %>%
+  tidyr::gather(group, value)
+
+ggplot(data = dat.gg) +
+  geom_density(aes(x = value, fill = group), alpha = 0.5) +
+  labs(title = "Group-level coefficients on flood frequency",
+       x = "Species group mean", 
+       y = "Density")
+
+```
+
+The surprisingly clear separation between the two groups suggests that flood frequency for plots over the landsat monitoring period (30 years) is informative about site conditions as perceived by the plants.
+
+
+### Species-level response to flood frequency
+
+The graph below shows the posterior distributions of individual species coefficients on plot flood frequency.
+
+```{r}
+
+dat.grp <- SpeciesSubset %>%
+  select(workingcode, model.group) %>%
+  mutate(model.group = factor(model.group, levels = 1:2, labels = c("terrestrial", "moist-wet")))
+
+
+ii <- str_detect(colnames(samples), "^b1")
+dat.gg <- as.data.frame(samples[, ii])
+colnames(dat.gg) <- SpeciesSubset$workingcode
+
+
+dat.gg <- dat.gg %>%
+  mutate(iter = 1:nrow(samples)) %>%
+  tidyr::gather(workingcode, b1.coeff, -iter) %>%
+  mutate(workingcode = as.integer(workingcode)) %>%
+  
+  left_join(dat.grp, by = "workingcode")
+
+
+gg <- ggplot(data = dat.gg) +
+  geom_density(aes(x = b1.coeff, group = factor(workingcode), colour = model.group)) +
+  
+  labs(title = "Species-level coefficients on flood frequency",
+       x = "Coefficient value",
+       y = "Density")
+
+print(gg)
+
+```
+
+
+### Coefficients for selected species
+
+Here we highlight some individual species to check whether trends estimated by the model seem believable. We concentrate on species with low to middling frequency of occurrence.
+
+```{r}
+
+fn_plotspecies <- function(the.species) {
+  rec <- SpeciesSubset %>%
+    filter( str_detect(workingname, the.species) )
+  
+  stopifnot(nrow(rec) == 1)
+  
+  dat.gg.sp <- dat.gg %>% filter(workingcode == rec$workingcode)
+  
+  the.group <- (dat.grp %>% filter(workingcode == rec$workingcode))$model.group
+  
+  title <- paste0(the.species, ": ", the.group, "; ", rec$nplots, " plots")
+  
+  gg +
+    geom_density(data = dat.gg.sp,
+                 aes(x = b1.coeff),
+                 colour = "black", size = 1.5) +
+    
+    labs(title = title)
+}
+
+```
+
+```{r}
+
+fn_plotspecies("Amphibromus fluitans")
+
+```
+
+
+
+```{r}
+
+fn_plotspecies("Brachyscome basaltica")
+
+```
+
+
+```{r}
+
+fn_plotspecies("Epilobium billardiereanum")
+
+```
+
+
+```{r}
+
+fn_plotspecies("Juncus holoschoenus")
+
+```
+
+
+```{r}
+
+fn_plotspecies("Ludwigia peploides")
+
+```
+
+
+```{r}
+
+fn_plotspecies("Dianella longifolia")
+
+```
+
+
+```{r}
+
+fn_plotspecies("Einadia nutans")
+
+```
+
+
+```{r}
+
+fn_plotspecies("Poa labillardierei")
+
+```
+
+
+```{r}
+
+fn_plotspecies("Wahlenbergia gracilis")
+
+```
+
+
+```{r}
+
+fn_plotspecies("Xerochrysum bracteatum")
+
+```
+
+
+### Predicted versus observed occurrences
+
+```{r}
+
+ii <- str_detect(colnames(samples), "^b(0|1)")
+
+dat.samples <- samples[, ii] %>%
+  as.data.frame() %>%
+  mutate(iter = 1:nrow(samples)) %>%
+  
+  tidyr::gather(var, value, -iter) %>%
+  
+  tidyr::separate(var, into = c("var", "spindex"), sep = "\\[") %>%
+  
+  mutate(spindex = str_extract(spindex, "\\d+") %>% as.integer(),
+         workingcode = SpeciesSubset$workingcode[spindex]) %>%
+  
+  tidyr::spread(var, value)
+
+
+fn_predict <- function(the.species) {
+  i <- str_detect(SpeciesSubset$workingname, the.species)
+  
+  if (sum(i) != 1) stop("Match failed for ", the.species)
+  
+  rec <- cbind(SpeciesSubset[i,], spindex = which(i))
+  
+  s <- dat.samples %>%
+    filter(workingcode == rec$workingcode) %>%
+    select(b0, b1) %>%
+    as.matrix()
+  
+  x <- cbind(intercept = 1, Np = dat.nfloods$Np) 
+  x <- t(x)
+
+  p <- plogis( s %*% x)
+  p <- colMeans(p)
+  
+  cbind(workingname = rec$workingname, 
+        dat.nfloods, 
+        prob = p, 
+        present = M.y[, rec$spindex])
+}
+
+```
+
+
+```{r}
+
+step <- 9
+gg <- lapply(seq(1, 95, step), function(isp) {
+  ii <- isp:min(isp + step - 1, 95)
+  the.species <- SpeciesSubset$workingname[ii]
+  pdat <- lapply(the.species, fn_predict)
+  
+  pdat <- do.call(rbind, pdat)
+  
+  ggplot(data = pdat, aes(x = N)) +
+    geom_line(aes(y = prob)) +
+    
+    geom_jitter(aes(y = present), 
+                width = 0, height = 0.05, shape = 1) +
+    
+    facet_wrap(~ workingname, ncol = 3)
+  
+})
+
+for (g in gg) print(g)
+
+```
+
+
