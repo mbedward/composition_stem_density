@@ -1705,11 +1705,3 @@ print(gg)
 ```
 
 
-Versions of the above graphs with species ordered by similarity in response to stem density.
-
-```{r}
-
-
-
-```
-
