@@ -17,9 +17,6 @@ library(here)
 library(rjags)
 library(R2jags)
 
-library(boral)
-#library(ggboral)
-
 library(dplyr)
 library(ggplot2)
 library(latex2exp)
@@ -27,8 +24,6 @@ library(readxl)
 library(stringr)
 library(tidyr)
 
-# local package
-data(SITES, package = "RRGcommon")
 
 # Random number seed
 set.seed(42)
@@ -47,8 +42,6 @@ theme_set( theme_bw() + theme(panel.grid = element_blank()))
 # Load common functions
 source(file = here("scripts", "common_functions.R"))
 
-# Size class look-up table
-data(SIZES, package = "RRGcommon")
 
 ```
 
@@ -72,6 +65,17 @@ In earlier models we used stochastic search variable selection (SSVS), implement
 
 
 ## Data
+
+Lookup tables for study sites and plots, and tree size classes (from the RRGcommon package used for other analyses).
+
+```{r}
+
+SITES <- load_from(here("data", "SITES.RData"))
+
+SIZES <- load_from(here("data", "SIZE_CLASSES.RData"))
+
+```
+
 
 Response data is a matrix of species occurrences within 9ha experimental plots. The data for each plot are formed by pooling records from the three floristics quadrats located within the plot.
 
@@ -172,11 +176,14 @@ rownames(M.y) <- SiteLookup$siteplot
 
 ### Tree stem density data
 
+Observed stem densities from pre- and post-thinning surveys. 
+
+Note - these are the same data as in the file `stems_complete.RData` in the related `red_gum_thinning/stem_densities` project.
+
 ```{r}
 
 # Stem data
-stems.dir <- here::here("..", "red_gum_thinning", "stem_densities")
-path <- file.path(stems.dir, "data", "stems_complete.RData")
+path <- here("data", "stems_observed_density.RData")
 
 DAT.stems.observed <- load_from(path) %>%
   # Subset to control and pre-thinning plot data
@@ -513,7 +520,9 @@ dat.stems.fitted <- post.samples[, ii] %>%
   })
 
 
-# Median estimages of stem means from the separately fitted JAGS model
+# Median estimates of stem means from the separately fitted JAGS model
+# used to develop the stem density sub-model.
+#
 path <- here::here("models", "fitted", "jags_subplotstems_median_params.RData")
 
 dat.stems.jags <- load_from(path) %>%
@@ -561,17 +570,21 @@ fn_plot <- function(the.plots) {
     
     scale_x_continuous(breaks = xbreaks, labels = 10*xbreaks) +
     
-    labs(x = "Tree size class", y = "Number of stems per 0.1ha")
+    labs(x = "Tree size class", 
+         y = "Number of stems per 0.1ha")
 }
 
 
+site.labels <- rep(1:22, each=3)
+plot.labels <- rep(1:3, 22)
+
 facet.labels <- paste(
-  rep(1:22, each=3),
-  rep(1:3, 22),
+  site.labels,
+  plot.labels,
   sep = ":"
 )
 
-names(facet.labels) <- 1:66
+names(site.labels) <- names(plot.labels) <- names(facet.labels) <- 1:66
 
 ```
 
@@ -580,9 +593,19 @@ names(facet.labels) <- 1:66
 for (i in seq(1, 66, 6)) {
   the.plots <- i:(i+5)
   
-  print( fn_plot(the.plots) +
-           facet_wrap(~ plot, scales = "free_y", 
-               labeller = as_labeller(facet.labels)) )
+  gg <- fn_plot(the.plots) +
+    facet_wrap(~ plot, scales = "free_y", 
+               labeller = as_labeller(facet.labels))
+  
+  p0 <- min(the.plots)
+  p1 <- max(the.plots)
+  filename <- paste0("stems_model_vs_obs_site", 
+                     site.labels[p0], "_", site.labels[p1],
+                     ".pdf")
+  
+  gg_pdf(gg, filename, pagesize("A4", "landscape"))
+  
+  print(gg)
 }
 
 ```
@@ -686,7 +709,7 @@ gg <- ggplot(data = dat.gg) +
 
 
 gg_pdf(plot = gg, 
-       file = here("models/outputs/model_chosen_stem_effects.pdf"), 
+       file = "model_chosen_stem_effects.pdf", 
        size = pagesize("A3"))
 
 print(gg)
@@ -891,7 +914,7 @@ Next we examine the predictions for individual species occurrence in plots and c
 
 # This will give summary matrices for each species stacked
 # one on the other
-predicted.occurrence <- lapply(1:nspecies, function(sp) {
+predicted.occurrence <- lapply(1:model.data$nspecies, function(sp) {
   lp <- model.linpred[,sp,]
   
   # transpose matrix lp to have samples as rows, plots as columns
@@ -1250,11 +1273,6 @@ Xstems.lookup <- Xstems.new %>%
   left_join(Xstems.new.predict, by = sznames) %>%
   select(label = label.x, data.index = index.x, prediction.index = index.y)
   
-
-Xstems.lookup <- Xstems.new %>%
-  select(label, data.index = index) %>%
-  mutate(prediction.index = fn(data.index, median.recs))
-
 ```
 
 
