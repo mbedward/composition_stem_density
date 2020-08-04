@@ -1601,19 +1601,31 @@ dat <- apply(res, MARGIN = c(1,2), function(lp) pnorm(mean(lp)))
 
 colnames(dat) <- SpeciesSubset$workingname
 
+# Classifiy species on probability of occurrence across all
+# hypothetical stands: general and dense
+#
+d <- dist(t(dat))
+h <- hclust(d, method = "median")
+specieslevels <- h$labels[h$order]
+
+
 dat.gg <- as.data.frame(dat) %>%
   mutate(prediction.index = row_number()) %>%
   
   tidyr::pivot_longer(-prediction.index, values_to = "prob",
                       names_to = "species", ) %>%
   
-  mutate(prob = round(prob, 2)) %>%
+  mutate(prob = round(prob, 2),
+         species = factor(species, levels = specieslevels)) %>%
   
   left_join(Xstems.lookup, by = "prediction.index") %>%
   
+  # Subset of 'general' stands
+  filter(!str_detect(label, "dense")) %>%
+  
   # To simplify the graph, just keep the data for stands 
   # at 20, 40, 60, 80th percentiles
-  filter(str_detect(label, "[2468]0$")) %>%
+  #filter(str_detect(label, "[2468]0$")) %>%
   
   # Vars for graph ordering
   mutate(sizegroup = str_extract(label, "^[a-z]+"),
@@ -1655,24 +1667,20 @@ Extreme stands:
 
 ```{r}
 
-# matrix of mean probability of occurrence with sites as rows and
-# species as columns
-#dat <- apply(res, MARGIN = c(1,2), function(lp) pnorm(mean(lp)))
-#
-#colnames(dat) <- SpeciesSubset$workingname
-
 dat.gg <- as.data.frame(dat) %>%
   mutate(prediction.index = row_number()) %>%
   
   tidyr::pivot_longer(-prediction.index, values_to = "prob",
                       names_to = "species", ) %>%
   
-  mutate(prob = round(prob, 2)) %>%
+  mutate(prob = round(prob, 2),
+         species = factor(species, levels = specieslevels)) %>%
   
   left_join(Xstems.lookup, by = "prediction.index") %>%
   
   # Subset to data for extreme stands
   filter(str_detect(label, "dense")) %>%
+  
   mutate(label = str_replace(label, "dense ", ""),
          label = factor(label, 
                         levels = c("Sm", "In", "Lg", "Sm.In", "Sm.Lg", "In.Lg"),
@@ -1697,4 +1705,11 @@ print(gg)
 ```
 
 
+Versions of the above graphs with species ordered by similarity in response to stem density.
+
+```{r}
+
+
+
+```
 
