@@ -1591,117 +1591,246 @@ print(gg)
 
 Two-way table style view of the median predictions of occurrence for species across the hypothetical stands, with separate figures for (a) general stands with either one size group varied and the others held at median values, or all groups (other than large) varied; (b) extreme stands with one or two size groups at 90th percentile density and the others at 10th percentile density.
 
-General stands:
+
+##### Probability of occurrence for species
+
+Calculate mean predicted probability of occurrence over all species and stands.
 
 ```{r}
 
 # matrix of mean probability of occurrence with sites as rows and
 # species as columns
-dat <- apply(res, MARGIN = c(1,2), function(lp) pnorm(mean(lp)))
+dat.meanprob <- apply(res, MARGIN = c(1,2), function(lp) pnorm(mean(lp)))
 
-colnames(dat) <- SpeciesSubset$workingname
+colnames(dat.meanprob) <- SpeciesSubset$workingname
 
-# Classifiy species on probability of occurrence across all
-# hypothetical stands: general and dense
-#
-d <- dist(t(dat))
-h <- hclust(d, method = "median")
-specieslevels <- h$labels[h$order]
+```
 
 
-dat.gg <- as.data.frame(dat) %>%
-  mutate(prediction.index = row_number()) %>%
-  
-  tidyr::pivot_longer(-prediction.index, values_to = "prob",
-                      names_to = "species", ) %>%
-  
-  mutate(prob = round(prob, 2),
-         species = factor(species, levels = specieslevels)) %>%
-  
-  left_join(Xstems.lookup, by = "prediction.index") %>%
-  
-  # Subset of 'general' stands
-  filter(!str_detect(label, "dense")) %>%
-  
-  # To simplify the graph, just keep the data for stands 
-  # at 20, 40, 60, 80th percentiles
-  #filter(str_detect(label, "[2468]0$")) %>%
-  
-  # Vars for graph ordering
-  mutate(sizegroup = str_extract(label, "^[a-z]+"),
-         sizegroup = factor(sizegroup, 
-                            levels = c("small", "intermediate", "large", "all")),
-         sizepercentile = str_extract(label, "\\d+"))
+Function to create graph data given predicted occurrence probabilities for a subset of species and hypothetical stands:
 
+```{r}
+
+fn_gdata <- function(dat.prob, 
+                     type = c("general", "extreme")) {
+  
+  stopifnot(is.matrix(dat.prob))
+  
+  type <- match.arg(type)
+  
+  # Classify species on probability of occurrence across hypothetical
+  # stands where all size groups are varied ('all10' - 'all90')
+  #
+  #ii <- str_detect(Xstems.lookup$label, "^all")
+  #ipred <- Xstems.lookup$prediction.index[ii]
+  #
+  #d <- dist(t(dat.prob[ipred, ]))
+  #h <- hclust(d, method = "centroid")
+  #specieslevels <- h$labels[h$order]
+  
+  
+  # Alternatively, order species on their mean probability of 
+  # occurrence when all tree sizes are at the 90th percentile 
+  # of modelled stem density
+  ii <- Xstems.lookup$label == "all90"
+  ipred <- Xstems.lookup$prediction.index[ii] 
+  p <- dat.prob[ipred, ]
+  specieslevels <- colnames(dat)[order(p)]
+  
+  
+  dat.gg <- as.data.frame(dat.prob) %>%
+    mutate(prediction.index = row_number()) %>%
+    
+    tidyr::pivot_longer(-prediction.index, values_to = "prob",
+                        names_to = "species", ) %>%
+    
+    mutate(prob = round(prob, 2),
+           species = factor(species, levels = specieslevels)) %>%
+    
+    left_join(Xstems.lookup, by = "prediction.index")
+  
+  if (type == "general") {
+    dat.gg <- dat.gg %>%
+      filter(!str_detect(label, "dense")) %>%
+    
+      # Vars for faceting and axis
+      mutate(sizegroup = str_extract(label, "^[a-z]+"),
+             sizegroup = factor(sizegroup, 
+                                levels = c("small", "intermediate", "large", "all")),
+             sizepercentile = str_extract(label, "\\d+"))
+  
+  } else {  # type == 'extreme'
+    dat.gg <- dat.gg %>%
+      filter(str_detect(label, "dense")) %>%
+      
+      mutate(label = str_replace(label, "dense ", ""),
+             label = factor(label, 
+                            levels = c("Sm", "In", "Lg", 
+                                       "Sm.In", "Sm.Lg", "In.Lg"),
+                            labels = c("Small", "Int", "Large", 
+                                       "Small+Int", "Small+Large", "Int+Large")))
+  }
+  
+  dat.gg
+}
+
+```
+
+
+Transformation object to do log-scaled fill shades for probability values.
+
+```{r}
 
 trans_species_prob <- scales::trans_new(
   "sp_prob",
   transform = function(p) ifelse(p == 0, -5, log(p)),
   inverse = function(x) ifelse(x <= -5, 0, exp(x))
 )
+  
+```
+
+
+General stands - native species:
+
+```{r}
+
+spp <- SpeciesSubset %>%
+  filter(!weed) %>%
+  pull(workingname)
+
+ii <- colnames(dat.meanprob) %in% spp
+dat <- dat.meanprob[, ii]
+
+dat.gg <- fn_gdata(dat, "general")
+
 
 gg <- ggplot(data = dat.gg) +
-  geom_tile(aes(x = sizepercentile, y = species, fill = prob)) +
-  
-  scale_fill_gradient(low = "#ffffff", high = "#000000", trans = trans_species_prob) +
-  
-  scale_x_discrete(position = "top") +
-  
-  facet_grid(cols = vars(sizegroup)) +
-  
-  labs(x = "", y = "") +
-  
-  theme(strip.placement = "outside",
-        strip.background = element_rect(fill=NA,colour="grey50"),
-        panel.spacing=unit(0,"cm"))
+    geom_tile(aes(x = sizepercentile, y = species, fill = prob)) +
+    
+    scale_fill_gradient(low = "#ffffff", high = "#000000", 
+                        trans = trans_species_prob) +
+    
+    scale_x_discrete(position = "top") +
+    
+    facet_grid(cols = vars(sizegroup)) +
+    
+    labs(title = "Native species", x = "", y = "") +
+    
+    theme(strip.placement = "outside",
+          strip.background = element_rect(fill=NA,colour="grey50"),
+          panel.spacing=unit(0,"cm"))
 
-
-gg_pdf(gg, "model_chosen_hypothetical_general_spp.pdf", pagesize("A3", "portrait"))
+gg_pdf(gg, 
+       "model_chosen_hypothetical_general_native_spp.pdf", 
+       pagesize("A3", "portrait"))
 
 print(gg)
 
 ```
 
 
-Extreme stands:
+General stands - exotic species:
 
 ```{r}
 
-dat.gg <- as.data.frame(dat) %>%
-  mutate(prediction.index = row_number()) %>%
-  
-  tidyr::pivot_longer(-prediction.index, values_to = "prob",
-                      names_to = "species", ) %>%
-  
-  mutate(prob = round(prob, 2),
-         species = factor(species, levels = specieslevels)) %>%
-  
-  left_join(Xstems.lookup, by = "prediction.index") %>%
-  
-  # Subset to data for extreme stands
-  filter(str_detect(label, "dense")) %>%
-  
-  mutate(label = str_replace(label, "dense ", ""),
-         label = factor(label, 
-                        levels = c("Sm", "In", "Lg", "Sm.In", "Sm.Lg", "In.Lg"),
-                        labels = c("Small", "Int", "Large", 
-                                   "Small+Int", "Small+Large", "Int+Large")))
-  
+spp <- SpeciesSubset %>%
+  filter(weed) %>%
+  pull(workingname)
+
+ii <- colnames(dat.meanprob) %in% spp
+dat <- dat.meanprob[, ii]
+
+dat.gg <- fn_gdata(dat, "general")
+
+
+gg <- ggplot(data = dat.gg) +
+    geom_tile(aes(x = sizepercentile, y = species, fill = prob)) +
+    
+    scale_fill_gradient(low = "#ffffff", high = "#000000", 
+                        trans = trans_species_prob) +
+    
+    scale_x_discrete(position = "top") +
+    
+    facet_grid(cols = vars(sizegroup)) +
+    
+    labs(title = "Exotic species", x = "", y = "") +
+    
+    theme(strip.placement = "outside",
+          strip.background = element_rect(fill=NA,colour="grey50"),
+          panel.spacing=unit(0,"cm"))
+
+gg_pdf(gg, 
+       "model_chosen_hypothetical_general_exotic_spp.pdf", 
+       pagesize("A3", "portrait"))
+
+print(gg)
+
+```
+
+
+
+Extreme stands - native species:
+
+```{r}
+
+spp <- SpeciesSubset %>%
+  filter(!weed) %>%
+  pull(workingname)
+
+ii <- colnames(dat.meanprob) %in% spp
+dat <- dat.meanprob[, ii]
+
+dat.gg <- fn_gdata(dat, "extreme")
+
 
 gg <- ggplot(data = dat.gg) +
   geom_tile(aes(x = label, y = species, fill = prob)) +
   
-  scale_fill_gradient(low = "#ffffff", high = "#000000", trans = trans_species_prob) +
+  scale_fill_gradient(low = "#ffffff", high = "#000000", 
+                      trans = trans_species_prob) +
   
   scale_x_discrete(position = "top") +
   
-  labs(x = "", y = "")
+  labs(title = "Native species", x = "", y = "")
   
 
-gg_pdf(gg, "model_chosen_hypothetical_extreme_spp.pdf", pagesize("A3", "portrait"))
+gg_pdf(gg, "model_chosen_hypothetical_extreme_native_spp.pdf", 
+       pagesize("A3", "portrait"))
 
 print(gg)
 
 ```
 
+
+Extreme stands - exotic species:
+
+```{r}
+
+spp <- SpeciesSubset %>%
+  filter(weed) %>%
+  pull(workingname)
+
+ii <- colnames(dat.meanprob) %in% spp
+dat <- dat.meanprob[, ii]
+
+dat.gg <- fn_gdata(dat, "extreme")
+
+
+gg <- ggplot(data = dat.gg) +
+  geom_tile(aes(x = label, y = species, fill = prob)) +
+  
+  scale_fill_gradient(low = "#ffffff", high = "#000000", 
+                      trans = trans_species_prob) +
+  
+  scale_x_discrete(position = "top") +
+  
+  labs(title = "Exotic species", x = "", y = "")
+  
+
+gg_pdf(gg, "model_chosen_hypothetical_extreme_exotic_spp.pdf", 
+       pagesize("A3", "portrait"))
+
+print(gg)
+
+```
 
