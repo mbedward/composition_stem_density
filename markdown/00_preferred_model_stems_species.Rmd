@@ -1607,36 +1607,40 @@ colnames(dat.meanprob) <- SpeciesSubset$workingname
 ```
 
 
-Function to create graph data given predicted occurrence probabilities for a subset of species and hypothetical stands:
+Function to create graph data given predicted occurrence probabilities for a subset of species and hypothetical stands. The data can be formatted for either 'general' stands ('small', 'intermediate', 'large', 'all') or 'dense' stands. The `orderby` parameter can be used to set species order to the probabilities for a specified stand (e.g. 'small10') or set to NULL for alphabetical ordering of species within habitat type.
 
 ```{r}
 
 fn_gdata <- function(dat.prob, 
-                     type = c("general", "extreme")) {
+                     type = c("general", "extreme"),
+                     orderby = NULL) {
   
   stopifnot(is.matrix(dat.prob))
   
   type <- match.arg(type)
-  
-  # Classify species on probability of occurrence across hypothetical
-  # stands where all size groups are varied ('all10' - 'all90')
-  #
-  #ii <- str_detect(Xstems.lookup$label, "^all")
-  #ipred <- Xstems.lookup$prediction.index[ii]
-  #
-  #d <- dist(t(dat.prob[ipred, ]))
-  #h <- hclust(d, method = "centroid")
-  #specieslevels <- h$labels[h$order]
-  
-  
-  # Alternatively, order species on their mean probability of 
-  # occurrence when all tree sizes are at the 90th percentile 
-  # of modelled stem density
-  ii <- Xstems.lookup$label == "all90"
-  ipred <- Xstems.lookup$prediction.index[ii] 
-  p <- dat.prob[ipred, ]
-  specieslevels <- colnames(dat)[order(p)]
-  
+
+  specieslookup <- SpeciesSubset %>%
+    filter(workingname %in% colnames(dat.prob)) %>%
+    
+    mutate(habitatprefix = str_extract_all(habitat, "\\b[a-z]") %>% 
+             sapply(., paste, collapse = "") %>%
+             toupper(),
+           label = paste0("(", habitatprefix, ") ", workingname))
+
+  # Species ordering
+  if (is.null(orderby)) {
+    # Order by species name within habitat
+    specieslookup <- specieslookup %>%
+      arrange(desc(habitat), desc(workingname))
+    
+  } else {
+    ii <- Xstems.lookup$label == orderby
+    if (!sum(ii) == 1) stop("orderby = ", orderby, " is not a stand label")
+
+    ipred <- Xstems.lookup$prediction.index[ii] 
+    p <- dat.prob[ipred, ]
+    specieslookup <- specieslookup[order(p), ]
+  }
   
   dat.gg <- as.data.frame(dat.prob) %>%
     mutate(prediction.index = row_number()) %>%
@@ -1645,9 +1649,12 @@ fn_gdata <- function(dat.prob,
                         names_to = "species", ) %>%
     
     mutate(prob = round(prob, 2),
-           species = factor(species, levels = specieslevels)) %>%
+           species = factor(species, 
+                            levels = specieslookup$workingname, 
+                            labels = specieslookup$label)) %>%
     
     left_join(Xstems.lookup, by = "prediction.index")
+  
   
   if (type == "general") {
     dat.gg <- dat.gg %>%
@@ -1690,7 +1697,7 @@ trans_species_prob <- scales::trans_new(
 ```
 
 
-General stands - native species:
+General stands - native species, ordered by habitat assignment
 
 ```{r}
 
@@ -1701,7 +1708,7 @@ spp <- SpeciesSubset %>%
 ii <- colnames(dat.meanprob) %in% spp
 dat <- dat.meanprob[, ii]
 
-dat.gg <- fn_gdata(dat, "general")
+dat.gg <- fn_gdata(dat, type = "general", orderby = NULL)
 
 
 gg <- ggplot(data = dat.gg) +
@@ -1721,7 +1728,7 @@ gg <- ggplot(data = dat.gg) +
           panel.spacing=unit(0,"cm"))
 
 gg_pdf(gg, 
-       "model_chosen_hypothetical_general_native_spp.pdf", 
+       "model_chosen_hypothetical_general_native_spp_habitat.pdf", 
        pagesize("A3", "portrait"))
 
 print(gg)
@@ -1729,7 +1736,46 @@ print(gg)
 ```
 
 
-General stands - exotic species:
+General stands - native species ordered by 'small90' stand
+
+```{r}
+
+spp <- SpeciesSubset %>%
+  filter(!weed) %>%
+  pull(workingname)
+
+ii <- colnames(dat.meanprob) %in% spp
+dat <- dat.meanprob[, ii]
+
+dat.gg <- fn_gdata(dat, type = "general", orderby = "small90")
+
+
+gg <- ggplot(data = dat.gg) +
+    geom_tile(aes(x = sizepercentile, y = species, fill = prob)) +
+    
+    scale_fill_gradient(low = "#ffffff", high = "#000000", 
+                        trans = trans_species_prob) +
+    
+    scale_x_discrete(position = "top") +
+    
+    facet_grid(cols = vars(sizegroup)) +
+    
+    labs(title = "Native species", x = "", y = "") +
+    
+    theme(strip.placement = "outside",
+          strip.background = element_rect(fill=NA,colour="grey50"),
+          panel.spacing=unit(0,"cm"))
+
+gg_pdf(gg, 
+       "model_chosen_hypothetical_general_native_spp_small90.pdf", 
+       pagesize("A3", "portrait"))
+
+print(gg)
+
+```
+
+
+General stands - exotic species ordered by 'small90' stand
 
 ```{r}
 
@@ -1740,7 +1786,7 @@ spp <- SpeciesSubset %>%
 ii <- colnames(dat.meanprob) %in% spp
 dat <- dat.meanprob[, ii]
 
-dat.gg <- fn_gdata(dat, "general")
+dat.gg <- fn_gdata(dat, "general", orderby = "small90")
 
 
 gg <- ggplot(data = dat.gg) +
@@ -1760,7 +1806,7 @@ gg <- ggplot(data = dat.gg) +
           panel.spacing=unit(0,"cm"))
 
 gg_pdf(gg, 
-       "model_chosen_hypothetical_general_exotic_spp.pdf", 
+       "model_chosen_hypothetical_general_exotic_spp_smal90.pdf", 
        pagesize("A3", "portrait"))
 
 print(gg)
@@ -1769,7 +1815,7 @@ print(gg)
 
 
 
-Extreme stands - native species:
+Extreme stands - native species ordered by habitat assignment
 
 ```{r}
 
@@ -1780,7 +1826,7 @@ spp <- SpeciesSubset %>%
 ii <- colnames(dat.meanprob) %in% spp
 dat <- dat.meanprob[, ii]
 
-dat.gg <- fn_gdata(dat, "extreme")
+dat.gg <- fn_gdata(dat, "extreme", orderby = NULL)
 
 
 gg <- ggplot(data = dat.gg) +
@@ -1794,7 +1840,7 @@ gg <- ggplot(data = dat.gg) +
   labs(title = "Native species", x = "", y = "")
   
 
-gg_pdf(gg, "model_chosen_hypothetical_extreme_native_spp.pdf", 
+gg_pdf(gg, "model_chosen_hypothetical_extreme_native_spp_habitat.pdf", 
        pagesize("A3", "portrait"))
 
 print(gg)
@@ -1802,7 +1848,40 @@ print(gg)
 ```
 
 
-Extreme stands - exotic species:
+Extreme stands - native species ordered by 'dense Sm' stand
+
+```{r}
+
+spp <- SpeciesSubset %>%
+  filter(!weed) %>%
+  pull(workingname)
+
+ii <- colnames(dat.meanprob) %in% spp
+dat <- dat.meanprob[, ii]
+
+dat.gg <- fn_gdata(dat, "extreme", orderby = "dense Sm")
+
+
+gg <- ggplot(data = dat.gg) +
+  geom_tile(aes(x = label, y = species, fill = prob)) +
+  
+  scale_fill_gradient(low = "#ffffff", high = "#000000", 
+                      trans = trans_species_prob) +
+  
+  scale_x_discrete(position = "top") +
+  
+  labs(title = "Native species", x = "", y = "")
+  
+
+gg_pdf(gg, "model_chosen_hypothetical_extreme_native_spp_habitat_densesm.pdf", 
+       pagesize("A3", "portrait"))
+
+print(gg)
+
+```
+
+
+Extreme stands - exotic species ordered by 'dense Sm' stand
 
 ```{r}
 
@@ -1813,7 +1892,7 @@ spp <- SpeciesSubset %>%
 ii <- colnames(dat.meanprob) %in% spp
 dat <- dat.meanprob[, ii]
 
-dat.gg <- fn_gdata(dat, "extreme")
+dat.gg <- fn_gdata(dat, "extreme", orderby = "dense Sm")
 
 
 gg <- ggplot(data = dat.gg) +
@@ -1827,7 +1906,7 @@ gg <- ggplot(data = dat.gg) +
   labs(title = "Exotic species", x = "", y = "")
   
 
-gg_pdf(gg, "model_chosen_hypothetical_extreme_exotic_spp.pdf", 
+gg_pdf(gg, "model_chosen_hypothetical_extreme_exotic_spp_densesm.pdf", 
        pagesize("A3", "portrait"))
 
 print(gg)
