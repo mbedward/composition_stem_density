@@ -172,6 +172,8 @@ rownames(M.y) <- SiteLookup$siteplot
 
 ## Unconstrained ordination
 
+This model relates species to two latent variables. No site predictors or random effects are included.
+
 ### JAGS model code
 
 ```{r}
@@ -305,4 +307,157 @@ gg_pdf(gg, filename = "unconstrained_ordination.pdf", size = pagesize("A4"))
 print(gg)
 
 ```
+
+
+## Latent variables plus flood groups
+
+This model adds the three flood history classification groups.
+
+### JAGS model code
+
+```{r}
+
+floodmodel.code <- "model {
+  # Model species occurrence
+  for(i in 1:nplots) {
+    for(j in 1:nspecies) { 
+      eta[i,j] <- inprod(lv.coefs[j,2:(num.lv+1)],lvs[i,]) +
+        flood.coefs[j, floodgroup[i]]
+
+      Z[i,j] ~ dnorm(lv.coefs[j,1] + eta[i,j], 1)
+      y[i,j] ~ dbern(step(Z[i,j]))
+    }
+  }
+  
+  ## Latent variables ##
+  for(i in 1:nplots) { for(k in 1:num.lv) { lvs[i,k] ~ dnorm(0,1) } } 
+  
+  ## Process level and priors ##
+  for(j in 1:nspecies) { lv.coefs[j,1] ~ dnorm(0,0.1) } ## Separate species intercepts
+  
+  ## Constraints on latent variables for rotation invariance
+  ## (based on scheme used in BORAL)
+  for(i in 1:(num.lv-1)) { 
+    for(j in (i+2):(num.lv+1)) {
+      # Constraints to 0 on upper diagonal
+      lv.coefs[i,j] <- 0 
+    } 
+  }
+  
+  for(i in 1:num.lv) { 
+     # Sign constraints on diagonal elements
+    lv.coefs[i,i+1] ~ dnorm(0,0.1)I(0,) 
+  }
+  
+  for(i in 2:num.lv) { 
+    for(j in 2:i) { 
+      # Free lower diagonals
+      lv.coefs[i,j] ~ dnorm(0,0.1) 
+    } 
+  }
+  
+  for(i in (num.lv+1):nspecies) { 
+    for(j in 2:(num.lv+1)) { 
+      # All other elements
+      lv.coefs[i,j] ~ dnorm(0,0.1)
+    } 
+  }
+  
+  # species coefficients on flood group
+  # drawn from Laplace priors with variance equal to that of 
+  # the boral default priors (10).
+
+  laplace.scale <- sqrt(2 / 10)
+  for(j in 1:nspecies) { 
+    for (kflood in 1:3) {
+      flood.coefs[j, kflood] ~ ddexp(0, laplace.scale) 
+    }
+  }
+}"
+
+```
+
+
+### Format data for the model
+
+```{r}
+
+floodmodel.data <- list(
+  y = M.y,
+  floodgroup = as.integer(SiteLookup$floodgroup),
+  nsites = max(SiteLookup$site),
+  nplots = nrow(M.y),
+  nspecies = ncol(M.y),
+  num.lv = 2
+)
+
+```
+
+
+### Compile and run the model
+
+```{r}
+
+ModelPath <- here::here("models", "fitted", "model_floodgroup.RData")
+
+if (REFIT_MODELS || !file.exists(ModelPath)) {
+  modelfit <- R2jags::jags(
+    data = floodmodel.data, 
+    inits = list(list(Z = fn_Zinit(M.y))), 
+    parameters.to.save = c("lvs", "flood.coefs"), 
+    model.file = textConnection(floodmodel.code),
+    n.chains = 1, 
+    n.iter = 210000, 
+    n.burnin = 10000, 
+    n.thin = 20
+  )
+  
+  
+  samples <- coda::mcmc(modelfit$BUGSoutput$sims.matrix, start = 1, thin = 1)
+  save(samples, file = ModelPath)
+  
+} else {
+  samples <- load_from(ModelPath)
+}
+  
+```
+
+Graph the sites and plots in ordination (latent variable) space.
+
+```{r}
+
+ii <- str_detect(colnames(samples), "lvs\\[")
+x <- apply(as.matrix(samples)[, ii], MARGIN = 2, median)
+
+dat.medians <- as.data.frame(x) %>%
+  rename(median = x) %>%
+  
+  mutate(indices = str_extract(rownames(.), "\\d+\\,\\d")) %>%
+  tidyr::separate(indices, into = c("plotindex", "lv"), sep = ",", convert = TRUE) %>%
+  mutate(site = 1 + ((plotindex - 1) %/% 3),
+         plot = 1 + ((plotindex - 1) %% 3)) %>%
+  
+  tidyr::pivot_wider(names_from = lv, names_prefix = "lv",
+                     values_from = median) %>%
+  
+  left_join(DAT.floodgroup, by = c("site", "plot"))
+  
+
+gg <- ggplot(data = dat.medians, aes(x = lv1, y = lv2, colour = floodgroup)) +
+  geom_point(size = 3, alpha = 0.4) +
+  geom_text_repel(aes(label = site)) +
+  
+  scale_colour_discrete("Flood\ngroup") +
+  
+  lims(x = c(-1, 2), y = c(-2, 1)) +
+  coord_equal() +
+  
+  labs(x = "Latent variable 1", y = "Latent variable 2")
+
+gg_pdf(gg, filename = "model_floodgroup.pdf", size = pagesize("A4"))
+
+print(gg)
+
+```
+
 
