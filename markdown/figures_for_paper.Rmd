@@ -1,0 +1,308 @@
+---
+title: "Figures for paper"
+author: "Michael Bedward (mbedward@uow.edu.au)"
+date: "17/08/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(dplyr, warn.conflicts = FALSE)
+library(stringr)
+
+library(rjags)
+library(R2jags)
+
+library(ggplot2)
+library(ggrepel)
+
+
+# Random number seed
+set.seed(42)
+
+# Set this to TRUE to force re-fitting of models if
+# cached objects exist. Set to FALSE to use cached outputs.
+REFIT_MODELS <- FALSE
+
+# Set this to TRUE to save graphs to file with the gg_pdf function (below).
+SAVE_GRAPHS <- TRUE
+
+# Default theme for graphs
+theme_set( theme_bw() + theme(panel.grid = element_blank()))
+
+# Load common functions
+source(file = here("scripts", "common_functions.R"))
+
+
+# Function to generate initial values for Z: matrix of probit values.
+# Takes the matrix of sites x species occurrences as an argument.
+#
+fn_Zinit <- function(y) {
+  nc <- ncol(y)
+  nr <- nrow(y)
+  
+  Tau <- rWishart(1, nc + 1, diag(nc))[, , 1]
+  Sigma <- solve(Tau)
+
+  Z <- abs(t(mvtnorm::rmvnorm(nr, rep(0, nc), Sigma)))
+  Z <- ifelse(as.matrix(y), Z, -1 * Z)
+  
+  Z
+}
+
+```
+
+
+## Summary
+
+This markdown document contains code to produce graphs for figures in the manuscript. It relies on data and fitted model objects that were (or should have been) saved to file from code in other documents.
+
+
+## Data
+
+Lookup tables for study sites and plots, and tree size classes (from the RRGcommon package used for other analyses).
+
+```{r}
+
+SITES <- load_from(here("data", "SITES.RData"))
+
+SIZES <- load_from(here("data", "SIZE_CLASSES.RData"))
+
+```
+
+
+Response data is a matrix of species occurrences within 9ha experimental plots. The data for each plot are formed by pooling records from the three floristics quadrats located within the plot.
+
+```{r}
+
+DAT.occurrence.long <- load_from( here("data", "site_species_boral.RData") ) %>%
+  
+  mutate(siteplot = paste0(site, "-", plot9ha)) %>%
+  
+  distinct(site, plot9ha, siteplot, workingcode)
+
+```
+
+
+Coding, name and habitat information for species.
+
+```{r}
+
+SPECIES.info <- load_from( here("data", "species_info_boral.RData") )
+
+```
+
+
+Summary of species prevalence in sites, plots and quadrats.
+
+```{r}
+
+SPECIES.summary <- load_from( here("data", "species_summary_boral.RData") )
+
+```
+
+
+Flood history plot groupings.
+
+```{r}
+
+DAT.floodgroup <- load_from( here("data", "flood_group_boral.RData") )
+
+```
+
+
+### Identify a subset of species for modelling
+
+Of the 200 species identified as candidates for modelling, 84 were only recorded in 1 or 2 experimental plots (most of the latter being in a single site). 
+
+The threshold number of occurrences set to include a species for modelling is hard to define, but given the complexity of the models to be fitted, a minimum of 5 plot occurrences is a reasonable starting point.
+
+We also remove Eucalpytus camaldulensis (present in all sites) from the data set.
+
+```{r}
+
+SpeciesSubset <- SPECIES.summary %>%
+  dplyr::filter(nplots >= 5) %>%
+  
+  left_join(SPECIES.info, by = c("workingcode", "workingname")) %>%
+  
+  # remove red gums
+  dplyr::filter(workingname != "Eucalyptus camaldulensis")
+
+cat("Subset with", nrow(SpeciesSubset), "taxa", 
+    "of which", sum(SpeciesSubset$weed), "are exotic \n")
+
+```
+
+### Species occurrence data matrix for modelling
+
+```{r}
+
+DAT.occurrence.subset <- DAT.occurrence.long %>%
+  dplyr::filter(workingcode %in% SpeciesSubset$workingcode)
+
+# Format response data as a matrix for boral
+M.y <- DAT.occurrence.subset %>%
+  mutate(present = 1) %>%
+  
+  tidyr::pivot_wider(names_from = workingcode, 
+                     values_from = present, values_fill = 0) %>%
+
+  # Order should be fine but just in case...
+  arrange(site, plot9ha)
+
+
+SiteLookup <- M.y %>%
+  dplyr::select(site, plot = plot9ha, siteplot) %>%
+  left_join(
+    SITES %>% dplyr::select(site, plot, site.quality),
+    by = c("site", "plot")
+  ) %>%
+  
+  left_join(DAT.floodgroup, by = c("site", "plot", "siteplot"))
+
+
+M.y <- as.matrix(M.y[ , -(1:3)])
+rownames(M.y) <- SiteLookup$siteplot
+
+```
+
+
+## Unconstrained ordination
+
+### JAGS model code
+
+```{r}
+
+ordination.code <- "model {
+  # Model species occurrence
+  for(i in 1:nplots) {
+    for(j in 1:nspecies) { 
+      eta[i,j] <- inprod(lv.coefs[j,2:(num.lv+1)],lvs[i,])
+
+      Z[i,j] ~ dnorm(lv.coefs[j,1] + eta[i,j], 1)
+      y[i,j] ~ dbern(step(Z[i,j]))
+    }
+  }
+  
+  ## Latent variables ##
+  for(i in 1:nplots) { for(k in 1:num.lv) { lvs[i,k] ~ dnorm(0,1) } } 
+  
+  ## Process level and priors ##
+  for(j in 1:nspecies) { lv.coefs[j,1] ~ dnorm(0,0.1) } ## Separate species intercepts
+  
+  ## Constraints on latent variables for rotation invariance
+  ## (based on scheme used in BORAL)
+  for(i in 1:(num.lv-1)) { 
+    for(j in (i+2):(num.lv+1)) {
+      # Constraints to 0 on upper diagonal
+      lv.coefs[i,j] <- 0 
+    } 
+  }
+  
+  for(i in 1:num.lv) { 
+     # Sign constraints on diagonal elements
+    lv.coefs[i,i+1] ~ dnorm(0,0.1)I(0,) 
+  }
+  
+  for(i in 2:num.lv) { 
+    for(j in 2:i) { 
+      # Free lower diagonals
+      lv.coefs[i,j] ~ dnorm(0,0.1) 
+    } 
+  }
+  
+  for(i in (num.lv+1):nspecies) { 
+    for(j in 2:(num.lv+1)) { 
+      # All other elements
+      lv.coefs[i,j] ~ dnorm(0,0.1)
+    } 
+  }
+}"
+
+```
+
+
+### Format data for the model
+
+```{r}
+
+ordination.data <- list(
+  y = M.y,
+  nsites = max(SiteLookup$site),
+  nplots = nrow(M.y),
+  nspecies = ncol(M.y),
+  num.lv = 2
+)
+
+```
+
+
+### Compile and run the model
+
+```{r}
+
+ModelPath <- here::here("models", "fitted", "unconstrained_ordination.RData")
+
+if (REFIT_MODELS || !file.exists(ModelPath)) {
+  modelfit <- R2jags::jags(
+    data = ordination.data, 
+    inits = list(list(Z = fn_Zinit(M.y))), 
+    parameters.to.save = "lvs", 
+    model.file = textConnection(ordination.code),
+    n.chains = 1, 
+    n.iter = 210000, 
+    n.burnin = 10000, 
+    n.thin = 20
+  )
+  
+  
+  samples <- coda::mcmc(modelfit$BUGSoutput$sims.matrix, start = 1, thin = 1)
+  save(samples, file = ModelPath)
+  
+} else {
+  samples <- load_from(ModelPath)
+}
+  
+```
+
+Graph the sites and plots in ordination (latent variable) space.
+
+```{r}
+
+ii <- str_detect(colnames(samples), "lvs\\[")
+x <- apply(as.matrix(samples)[, ii], MARGIN = 2, median)
+
+dat.medians <- as.data.frame(x) %>%
+  rename(median = x) %>%
+  
+  mutate(indices = str_extract(rownames(.), "\\d+\\,\\d")) %>%
+  tidyr::separate(indices, into = c("plotindex", "lv"), sep = ",", convert = TRUE) %>%
+  mutate(site = 1 + ((plotindex - 1) %/% 3),
+         plot = 1 + ((plotindex - 1) %% 3)) %>%
+  
+  tidyr::pivot_wider(names_from = lv, names_prefix = "lv",
+                     values_from = median) %>%
+  
+  left_join(DAT.floodgroup, by = c("site", "plot"))
+  
+
+gg <- ggplot(data = dat.medians, aes(x = lv1, y = lv2, colour = floodgroup)) +
+  geom_point(size = 3, alpha = 0.4) +
+  geom_text_repel(aes(label = site)) +
+  
+  scale_colour_discrete("Flood\ngroup") +
+  
+  lims(x = c(-1, 2), y = c(-2, 1)) +
+  coord_equal() +
+  
+  labs(x = "Latent variable 1", y = "Latent variable 2")
+
+gg_pdf(gg, filename = "unconstrained_ordination.pdf", size = pagesize("A4"))
+
+print(gg)
+
+```
+
