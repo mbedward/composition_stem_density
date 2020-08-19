@@ -26,9 +26,6 @@ set.seed(42)
 # cached objects exist. Set to FALSE to use cached outputs.
 REFIT_MODELS <- FALSE
 
-# Set this to TRUE to save graphs to file with the gg_pdf function (below).
-SAVE_GRAPHS <- TRUE
-
 # Default theme for graphs
 theme_set( theme_bw() + theme(panel.grid = element_blank()))
 
@@ -454,10 +451,214 @@ gg <- ggplot(data = dat.medians, aes(x = lv1, y = lv2, colour = floodgroup)) +
   
   labs(x = "Latent variable 1", y = "Latent variable 2")
 
-gg_pdf(gg, filename = "model_floodgroup.pdf", size = pagesize("A4"))
+gg_pdf(gg, filename = "model_floodgroup_ordination.pdf", size = pagesize("A4"))
 
 print(gg)
 
 ```
 
+
+## Preferred model
+
+This is the preferred model, with latent variables plus flood groups, stem density and nested random effects (plot within site). See the document `00_preferred_model_stems_species.Rmd` for model code and fitting details. Here we assume that MCMC samples have been saved to file.
+
+```{r}
+
+ModelPath <- here::here("models", "fitted", "model_chosen_mcmc.RData")
+
+if (!file.exists(ModelPath)) 
+  stop("Missing file with MCMC samples for chosen model")
+
+samples <- load_from(ModelPath)
+
+# Discard log-likelihood params
+ii <- str_detect(colnames(samples), "loglik")
+samples <- samples[, !ii]
+
+```
+
+
+Graph the sites and plots in ordination (latent variable) space.
+
+```{r}
+
+ii <- str_detect(colnames(samples), "lvs\\[")
+x <- apply(as.matrix(samples)[, ii], MARGIN = 2, median)
+
+dat.medians <- as.data.frame(x) %>%
+  rename(median = x) %>%
+  
+  mutate(indices = str_extract(rownames(.), "\\d+\\,\\d")) %>%
+  tidyr::separate(indices, into = c("plotindex", "lv"), sep = ",", convert = TRUE) %>%
+  mutate(site = 1 + ((plotindex - 1) %/% 3),
+         plot = 1 + ((plotindex - 1) %% 3)) %>%
+  
+  tidyr::pivot_wider(names_from = lv, names_prefix = "lv",
+                     values_from = median) %>%
+  
+  left_join(DAT.floodgroup, by = c("site", "plot"))
+  
+
+gg <- ggplot(data = dat.medians, aes(x = lv1, y = lv2, colour = floodgroup)) +
+  geom_point(size = 3, alpha = 0.4) +
+  geom_text_repel(aes(label = site)) +
+  
+  scale_colour_discrete("Flood\ngroup") +
+  
+  lims(x = c(-1.5, 2), y = c(-1.5, 2)) +
+  coord_equal() +
+  
+  labs(x = "Latent variable 1", y = "Latent variable 2")
+
+gg_pdf(gg, filename = "model_chosen_ordination.pdf", size = pagesize("A4"))
+
+print(gg)
+
+```
+
+### Variance partitioning
+
+
+```{r}
+
+nplots <- nrow(SiteLookup)
+nspp <- nrow(SpeciesSubset)
+nsizeclasses <- 6 # aggregated size classes
+nfloodgrp <- 3
+nlv <- 2
+niter <- nrow(samples)
+
+# Mapping from field to model aggregate size classes
+FieldToModelSizeClass <- list(
+  1, 2, 3, 4, 5:8, 9:11
+)
+names(FieldToModelSizeClass) <- c("less10cm", "from10to20cm", "from20to30cm",
+                                  "from30to40cm", "from40to80cm", "from80cm")
+
+get_indices <- function(ptn, n.expected = NULL) {
+  ii <- str_detect(colnames(samples), ptn)
+  if (!is.null(n.expected)) {
+    stopifnot(sum(ii) == n.expected)
+  }
+  ii
+}
+
+ii.lvcoefs <- get_indices("lv.coefs", nspp * (1 + nlv))
+ii.stemcoefs <- get_indices("stem.coefs", nspp * nsizeclasses)
+ii.floodcoefs <- get_indices("flood.coefs", nspp * nfloodgrp)
+ii.site.sigma <- get_indices("site.sigma", 1)
+ii.siteplot.sigma <- get_indices("siteplot.sigma", 1)
+
+ii.lvs <- get_indices("lvs", nplots * 2)
+ii.mu.stems <- get_indices("mu.stems", nplots * 11) # 11 field size classes
+
+m.floodgroup <- matrix(0, nrow = nplots, ncol = nfloodgrp)
+ii <- cbind(1:nplots, SiteLookup$floodgroup)
+m.floodgroup[ii] <- 1
+
+
+intercept_var <- lv_var <- stem_var <- 
+  flood_var <- raneff_var <- matrix(0, niter, nspp)
+
+
+for (k in 1:nrow(samples)) {
+  # species intercepts (col 1) and latent variable coefs (cols 2-3)
+  lv.coefs <- matrix(samples[k, ii.lvcoefs], nrow = nspp)
+
+  intercept_var[k, ] <- lv.coefs[,1]^2
+  lv_var[k, ] <- rowSums(lv.coefs[, 2:(1+nlv)]^2)
+  
+  # contribution of stem density
+  stem.coefs <- matrix(samples[k, ii.stemcoefs], nrow = nspp)
+  mu.stems <- matrix(samples[k, ii.mu.stems], nrow = nplots)
+  
+  # aggregate modelled field counts to the broader six size classes
+  X.stems <- lapply(FieldToModelSizeClass, function(cols) {
+    x <- rep(0, nplots)
+    for (k in cols) {
+      x <- x + mu.stems[,k]
+    }
+    x
+  })
+  X.stems <- do.call(cbind, X.stems)
+  
+  stem.linpred <- tcrossprod(X.stems, stem.coefs)
+  stem_var[k, ] <- apply(stem.linpred, 2, var)
+
+  # contribution of flood group
+  flood.coefs <- matrix(samples[k, ii.floodcoefs], nrow = nspp)
+  flood.linpred <- tcrossprod(m.floodgroup, flood.coefs)
+  flood_var[k, ] <- apply(flood.linpred, 2, var)
+
+  # contribution of the nested random effect
+  raneff_var[k, ] <- samples[k, ii.site.sigma]^2 + samples[k, ii.siteplot.sigma]^2
+}
+
+
+total.var <- intercept_var + lv_var + stem_var + flood_var + raneff_var
+
+
+dat.varpart <- SpeciesSubset %>%
+  select(workingname, weed, habitat) %>%
+  
+  mutate(intercept = colMeans(intercept_var / total.var),
+         lv = colMeans(lv_var / total.var),
+         stem = colMeans(stem_var / total.var),
+         flood = colMeans(flood_var / total.var),
+         raneff = colMeans(raneff_var / total.var) )
+
+```
+
+
+For each species, we estimate the relative proportion of variance accounted for by its intercept, latent variables, flood group, stem density and nested random effect.
+
+```{r fig.height=8}
+
+dat.gg <- dat.varpart %>%
+  tidyr::pivot_longer(cols = c(intercept, lv, stem, flood, raneff),
+                      names_to = "varpart",
+                      values_to = "value")
+  
+
+# arrange names in order of variance accounted for by stem density
+name.order <- dat.gg %>%
+  filter(varpart == "stem") %>%
+  arrange(value) %>%
+  mutate(name.habitat = sprintf("%s (%s)", workingname, habitat)) %>%
+  select(workingname, name.habitat)
+           
+
+dat.gg <- dat.gg %>%
+  mutate(label = factor(workingname, 
+                        levels = name.order$workingname, 
+                        labels = name.order$name.habitat),
+         
+         varpart = factor(varpart,
+                          levels = c("Species intercept" = "intercept", 
+                                     "Site-plot effect" = "raneff", 
+                                     "Latent variables" = "lv", 
+                                     "Flood group" = "flood", 
+                                     "Stem density" = "stem")) )
+
+gg <- ggplot(data = dat.gg) +
+  geom_bar(aes(x = label, y = value, fill = varpart),
+             stat = "identity", width = 0.5, alpha = 0.6) +
+
+    scale_fill_viridis_d(name = "Variance component",
+                         begin = 0, end = 0.8, direction = -1) +
+
+    labs(x = "", y = "Proportion of variance") +
+
+    coord_flip() +
+
+    theme(legend.position = "right")
+
+
+gg_pdf(gg, 
+       size = pagesize("A3", "portrait", "cm"),
+       filename = "chosen_model_varpart.pdf")
+
+print(gg)
+
+```
 
