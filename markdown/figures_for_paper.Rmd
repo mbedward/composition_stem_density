@@ -517,7 +517,63 @@ print(gg)
 
 ```
 
-### Variance partitioning
+## Combined graph with aligned ordinations
+
+```{r}
+
+# Check if package vegan is installed
+if (!("vegan" %in% installed.packages()[, "Package"])) {
+  stop("package vegan is required for the combined ordination graph")
+}
+
+
+res <- vegan::procrustes(dat.medians.unconstrained[, c("lv1", "lv2")],
+                         dat.medians.flood[, c("lv1", "lv2")])
+
+dat.medians.flood.rot <- dat.medians.flood
+dat.medians.flood.rot$lv1 <- res$Yrot[,1]
+dat.medians.flood.rot$lv2 <- res$Yrot[,2]
+
+
+res <- vegan::procrustes(dat.medians.unconstrained[, c("lv1", "lv2")],
+                         dat.medians.chosen[, c("lv1", "lv2")])
+
+dat.medians.chosen.rot <- dat.medians.chosen
+dat.medians.chosen.rot$lv1 <- res$Yrot[,1]
+dat.medians.chosen.rot$lv2 <- res$Yrot[,2]
+
+
+dat.gg <- bind_rows(
+  dat.medians.unconstrained %>% mutate(model = "unconstrained"),
+  dat.medians.flood.rot %>% mutate(model = "flood"),
+  dat.medians.chosen.rot %>% mutate(model = "chosen") ) %>%
+  
+  mutate(model = factor(model, levels = c("unconstrained", "flood", "chosen")))
+
+
+gg <- ggplot(data = dat.gg, aes(x = lv1, y = lv2, colour = floodgroup)) +
+  geom_point(size = 3, alpha = 0.4) +
+  geom_text_repel(aes(label = site)) +
+  
+  scale_colour_discrete("Flood\ngroup") +
+  
+  #lims(x = c(-1.5, 2), y = c(-1.5, 2)) +
+  coord_equal() +
+  
+  labs(x = "Latent variable 1", y = "Latent variable 2") +
+  
+  facet_wrap(~ model)
+
+
+gg_pdf(gg, filename = "all_ordinations.pdf", size = pagesize("A3", "landscape"))
+
+print(gg)
+
+```
+
+
+
+## Variance partitioning
 
 **WARNING** Variance partitioning based on linear predictor values, as calculated below, did not prove useful. The code below is retained in case it is of interest for other projects.
 
