@@ -274,7 +274,7 @@ Graph the sites and plots in ordination (latent variable) space.
 ii <- str_detect(colnames(samples), "lvs\\[")
 x <- apply(as.matrix(samples)[, ii], MARGIN = 2, median)
 
-dat.medians <- as.data.frame(x) %>%
+dat.medians.unconstrained <- as.data.frame(x) %>%
   rename(median = x) %>%
   
   mutate(indices = str_extract(rownames(.), "\\d+\\,\\d")) %>%
@@ -288,7 +288,8 @@ dat.medians <- as.data.frame(x) %>%
   left_join(DAT.floodgroup, by = c("site", "plot"))
   
 
-gg <- ggplot(data = dat.medians, aes(x = lv1, y = lv2, colour = floodgroup)) +
+gg <- ggplot(data = dat.medians.unconstrained, 
+             aes(x = lv1, y = lv2, colour = floodgroup)) +
   geom_point(size = 3, alpha = 0.4) +
   geom_text_repel(aes(label = site)) +
   
@@ -426,7 +427,7 @@ Graph the sites and plots in ordination (latent variable) space.
 ii <- str_detect(colnames(samples), "lvs\\[")
 x <- apply(as.matrix(samples)[, ii], MARGIN = 2, median)
 
-dat.medians <- as.data.frame(x) %>%
+dat.medians.flood <- as.data.frame(x) %>%
   rename(median = x) %>%
   
   mutate(indices = str_extract(rownames(.), "\\d+\\,\\d")) %>%
@@ -440,7 +441,7 @@ dat.medians <- as.data.frame(x) %>%
   left_join(DAT.floodgroup, by = c("site", "plot"))
   
 
-gg <- ggplot(data = dat.medians, aes(x = lv1, y = lv2, colour = floodgroup)) +
+gg <- ggplot(data = dat.medians.flood, aes(x = lv1, y = lv2, colour = floodgroup)) +
   geom_point(size = 3, alpha = 0.4) +
   geom_text_repel(aes(label = site)) +
   
@@ -485,7 +486,7 @@ Graph the sites and plots in ordination (latent variable) space.
 ii <- str_detect(colnames(samples), "lvs\\[")
 x <- apply(as.matrix(samples)[, ii], MARGIN = 2, median)
 
-dat.medians <- as.data.frame(x) %>%
+dat.medians.chosen <- as.data.frame(x) %>%
   rename(median = x) %>%
   
   mutate(indices = str_extract(rownames(.), "\\d+\\,\\d")) %>%
@@ -499,7 +500,7 @@ dat.medians <- as.data.frame(x) %>%
   left_join(DAT.floodgroup, by = c("site", "plot"))
   
 
-gg <- ggplot(data = dat.medians, aes(x = lv1, y = lv2, colour = floodgroup)) +
+gg <- ggplot(data = dat.medians.chosen, aes(x = lv1, y = lv2, colour = floodgroup)) +
   geom_point(size = 3, alpha = 0.4) +
   geom_text_repel(aes(label = site)) +
   
@@ -518,8 +519,12 @@ print(gg)
 
 ### Variance partitioning
 
+**WARNING** Variance partitioning based on linear predictor values, as calculated below, did not prove useful. The code below is retained in case it is of interest for other projects.
 
-```{r}
+Ubiquitous species which, by definition, were unresponsive to tree stem density, were assigned a large proportion of variance due to stems. This reflected high linear predictor values which were variable but which all corresponded to probabilities > 0.99. Hence the variance was essentially noise. In addition, the use of unscaled predictor values for stem density within size classes was not accounted for in the calculations below.
+
+
+```{r eval = FALSE}
 
 nplots <- nrow(SiteLookup)
 nspp <- nrow(SpeciesSubset)
@@ -612,7 +617,7 @@ dat.varpart <- SpeciesSubset %>%
 
 For each species, we estimate the relative proportion of variance accounted for by its intercept, latent variables, flood group, stem density and nested random effect.
 
-```{r fig.height=8}
+```{r fig.height=8, eval = FALSE}
 
 dat.gg <- dat.varpart %>%
   tidyr::pivot_longer(cols = c(intercept, lv, stem, flood, raneff),
