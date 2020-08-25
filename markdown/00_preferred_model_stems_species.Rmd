@@ -32,6 +32,10 @@ set.seed(42)
 # cached objects exist. Set to FALSE to use cached outputs.
 REFIT_MODELS <- FALSE
 
+# Set this to TRUE to force re-fitting of predictions
+# if cached objects exist. Set to FALSE to use cached outputs.
+REFIT_PREDICTIONS <- FALSE
+
 # Set this to TRUE to save graphs to file with the gg_pdf function (below).
 SAVE_GRAPHS <- TRUE
 
@@ -1170,18 +1174,23 @@ New sites with varying density of selected (grouped) size classes:
 
 ```{r}
 
-# Small trees (first two size classes, <=20cm); other size classes set to median values
+# Small trees (model size classes 1-2, <=20cm); other size classes 
+# set to median values
 Xstems.small <- qdat
 for (k in 3:6) Xstems.small[,k] <- qdat[5,k]
 
 
-# New sites with varying density of intermediate size classes (<30cm, <40cm)
+# New sites with varying density of intermediate size classes 
+# (model size classes 3-5: 20-80cm); other size classes
+# set to median values
 Xstems.intermediate <- qdat
-for (k in c(1,2,5,6)) Xstems.intermediate[,k] <- qdat[5,k] 
+for (k in c(1,2,6)) Xstems.intermediate[,k] <- qdat[5,k] 
 
-# New sites with varying density of the largest trees (<80cm, >80cm)
+# New sites with varying density of the largest trees 
+# (model size class 6: >80cm); other size classes set to
+# median values
 Xstems.large <- qdat
-for (k in 1:4) Xstems.large[,k] <- qdat[5,k]
+for (k in 1:5) Xstems.large[,k] <- qdat[5,k]
 
 # New sites with varying density of all but the largest size class.
 Xstems.all <- qdat
@@ -1196,21 +1205,21 @@ Xstems.dense.Sm <- cbind(qdat[9, 1:2, drop=FALSE],
 
 # small 10%, intermediate 90%, large 10%
 Xstems.dense.In <- cbind(qdat[1, 1:2, drop=FALSE],
-                         qdat[9, 3:4, drop=FALSE], 
-                         qdat[1, 5:6, drop=FALSE])
+                         qdat[9, 3:5, drop=FALSE], 
+                         qdat[1, 6, drop=FALSE])
 
 # small 10%, intermediate 10%, large 90%
-Xstems.dense.Lg <- cbind(qdat[1, 1:4, drop=FALSE], 
-                         qdat[9, 5:6, drop=FALSE])
+Xstems.dense.Lg <- cbind(qdat[1, 1:5, drop=FALSE], 
+                         qdat[9, 6, drop=FALSE])
 
 # small 90%, intermediate 90%, large 10%
-Xstems.dense.SmIn <- cbind(qdat[9, 1:4, drop=FALSE], 
-                           qdat[1, 5:6, drop=FALSE])
+Xstems.dense.SmIn <- cbind(qdat[9, 1:5, drop=FALSE], 
+                           qdat[1, 6, drop=FALSE])
 
 # small 90%, intermediate 10%, large 90%
 Xstems.dense.SmLg <- cbind(qdat[9, 1:2, drop=FALSE],
-                           qdat[1, 3:4, drop=FALSE], 
-                           qdat[9, 5:6, drop=FALSE])
+                           qdat[1, 3:5, drop=FALSE], 
+                           qdat[9, 6, drop=FALSE])
 
 # small 10%, intermediate 90%, large 90%
 Xstems.dense.InLg <- cbind(qdat[1, 1:2, drop=FALSE],
@@ -1330,7 +1339,7 @@ print(gg)
 
 path <- here::here("models", "predictions", "model_chosen_new_site_predictions.RData")
 
-if (REFIT_MODELS || !file.exists(path)) {
+if (REFIT_PREDICTIONS || !file.exists(path)) {
   res <- predict_new_sites(post.samples = post.samples,
                            Xstems = as.matrix(Xstems.new.predict[, 1:6]))
   
@@ -1468,7 +1477,7 @@ dat.gg <- Xstems.lookup %>%
 
 ```{r  fig.width=8, fig.height=10}
 
-dodgew <- 0
+dodgew <- 0.5
 
 gg <- ggplot(data = dat.gg, aes(x = label, colour = grp, group = status)) +
   geom_linerange(aes(ymin = lwr95, ymax = upr95),
