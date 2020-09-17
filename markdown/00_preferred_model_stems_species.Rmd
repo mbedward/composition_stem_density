@@ -2,8 +2,6 @@
 title: "Preferred model of composition versus stem density and flood history"
 author: "Michael Bedward (mbedward@uow.edu.au)"
 date: "24/07/2020"
-output: html_document
----
 output:
   word_document: default
   html_document: default

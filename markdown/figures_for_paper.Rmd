@@ -476,6 +476,12 @@ samples <- load_from(ModelPath)
 ii <- str_detect(colnames(samples), "loglik")
 samples <- samples[, !ii]
 
+ii <- str_detect(colnames(samples), "loglik")
+post.samples <- as.matrix(samples[, !ii])
+
+rm(samples)
+gc()
+
 ```
 
 
@@ -483,8 +489,8 @@ Graph the sites and plots in ordination (latent variable) space.
 
 ```{r}
 
-ii <- str_detect(colnames(samples), "lvs\\[")
-x <- apply(as.matrix(samples)[, ii], MARGIN = 2, median)
+ii <- str_detect(colnames(post.samples), "lvs\\[")
+x <- apply(post.samples[, ii], MARGIN = 2, median)
 
 dat.medians.chosen <- as.data.frame(x) %>%
   rename(median = x) %>%
@@ -587,7 +593,7 @@ nspp <- nrow(SpeciesSubset)
 nsizeclasses <- 6 # aggregated size classes
 nfloodgrp <- 3
 nlv <- 2
-niter <- nrow(samples)
+niter <- nrow(post.samples)
 
 # Mapping from field to model aggregate size classes
 FieldToModelSizeClass <- list(
@@ -597,7 +603,7 @@ names(FieldToModelSizeClass) <- c("less10cm", "from10to20cm", "from20to30cm",
                                   "from30to40cm", "from40to80cm", "from80cm")
 
 get_indices <- function(ptn, n.expected = NULL) {
-  ii <- str_detect(colnames(samples), ptn)
+  ii <- str_detect(colnames(post.samples), ptn)
   if (!is.null(n.expected)) {
     stopifnot(sum(ii) == n.expected)
   }
@@ -622,16 +628,16 @@ intercept_var <- lv_var <- stem_var <-
   flood_var <- raneff_var <- matrix(0, niter, nspp)
 
 
-for (k in 1:nrow(samples)) {
+for (k in 1:nrow(post.samples)) {
   # species intercepts (col 1) and latent variable coefs (cols 2-3)
-  lv.coefs <- matrix(samples[k, ii.lvcoefs], nrow = nspp)
+  lv.coefs <- matrix(post.samples[k, ii.lvcoefs], nrow = nspp)
 
   intercept_var[k, ] <- lv.coefs[,1]^2
   lv_var[k, ] <- rowSums(lv.coefs[, 2:(1+nlv)]^2)
   
   # contribution of stem density
-  stem.coefs <- matrix(samples[k, ii.stemcoefs], nrow = nspp)
-  mu.stems <- matrix(samples[k, ii.mu.stems], nrow = nplots)
+  stem.coefs <- matrix(post.samples[k, ii.stemcoefs], nrow = nspp)
+  mu.stems <- matrix(post.samples[k, ii.mu.stems], nrow = nplots)
   
   # aggregate modelled field counts to the broader six size classes
   X.stems <- lapply(FieldToModelSizeClass, function(cols) {
@@ -647,12 +653,12 @@ for (k in 1:nrow(samples)) {
   stem_var[k, ] <- apply(stem.linpred, 2, var)
 
   # contribution of flood group
-  flood.coefs <- matrix(samples[k, ii.floodcoefs], nrow = nspp)
+  flood.coefs <- matrix(post.samples[k, ii.floodcoefs], nrow = nspp)
   flood.linpred <- tcrossprod(m.floodgroup, flood.coefs)
   flood_var[k, ] <- apply(flood.linpred, 2, var)
 
   # contribution of the nested random effect
-  raneff_var[k, ] <- samples[k, ii.site.sigma]^2 + samples[k, ii.siteplot.sigma]^2
+  raneff_var[k, ] <- post.samples[k, ii.site.sigma]^2 + post.samples[k, ii.siteplot.sigma]^2
 }
 
 
