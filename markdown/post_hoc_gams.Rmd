@@ -1,0 +1,257 @@
+---
+title: "Post-hoc GAMS of species responses"
+output: 
+  word_document: 
+    fig_width: 8
+    fig_height: 10
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(here)
+library(dplyr, warn.conflicts = FALSE)
+library(stringr)
+
+library(rjags)
+library(R2jags)
+
+library(ggplot2)
+library(ggrepel)
+
+
+# Random number seed
+set.seed(42)
+
+# Set this to TRUE to force re-fitting of models if
+# cached objects exist. Set to FALSE to use cached outputs.
+REFIT_MODELS <- FALSE
+
+# Default theme for graphs
+theme_set( theme_bw() + theme(panel.grid = element_blank()))
+
+# Load common functions
+source(file = here("scripts", "common_functions.R"))
+
+```
+
+
+## Data
+
+Lookup tables for study sites and plots, and tree size classes (from the RRGcommon package used for other analyses).
+
+```{r}
+
+SITES <- load_from(here("data", "SITES.RData"))
+
+SIZES <- load_from(here("data", "SIZE_CLASSES.RData"))
+
+```
+
+
+Response data is a matrix of species occurrences within 9ha experimental plots. The data for each plot are formed by pooling records from the three floristics quadrats located within the plot.
+
+```{r}
+
+DAT.occurrence.long <- load_from( here("data", "site_species_boral.RData") ) %>%
+  
+  mutate(siteplot = paste0(site, "-", plot9ha)) %>%
+  
+  distinct(site, plot9ha, siteplot, workingcode)
+
+```
+
+
+Coding, name and habitat information for species.
+
+```{r}
+
+SPECIES.info <- load_from( here("data", "species_info_boral.RData") )
+
+```
+
+
+Summary of species prevalence in sites, plots and quadrats.
+
+```{r}
+
+SPECIES.summary <- load_from( here("data", "species_summary_boral.RData") )
+
+```
+
+
+Flood history plot groupings.
+
+```{r}
+
+DAT.floodgroup <- load_from( here("data", "flood_group_boral.RData") )
+
+```
+
+
+### Identify a subset of species for modelling
+
+Of the 200 species identified as candidates for modelling, 84 were only recorded in 1 or 2 experimental plots (most of the latter being in a single site). 
+
+The threshold number of occurrences set to include a species for modelling is hard to define, but given the complexity of the models to be fitted, a minimum of 5 plot occurrences is a reasonable starting point.
+
+We also remove Eucalpytus camaldulensis (present in all sites) from the data set.
+
+```{r}
+
+SpeciesSubset <- SPECIES.summary %>%
+  dplyr::filter(nplots >= 5) %>%
+  
+  left_join(SPECIES.info, by = c("workingcode", "workingname")) %>%
+  
+  # remove red gums
+  dplyr::filter(workingname != "Eucalyptus camaldulensis")
+
+cat("Subset with", nrow(SpeciesSubset), "taxa", 
+    "of which", sum(SpeciesSubset$weed), "are exotic \n")
+
+```
+
+### Species occurrence data matrix for modelling
+
+```{r}
+
+DAT.occurrence.subset <- DAT.occurrence.long %>%
+  dplyr::filter(workingcode %in% SpeciesSubset$workingcode)
+
+# Format response data as a matrix for boral
+M.y <- DAT.occurrence.subset %>%
+  mutate(present = 1) %>%
+  
+  tidyr::pivot_wider(names_from = workingcode, 
+                     values_from = present, values_fill = 0) %>%
+
+  # Order should be fine but just in case...
+  arrange(site, plot9ha)
+
+
+SiteLookup <- M.y %>%
+  dplyr::select(site, plot = plot9ha, siteplot) %>%
+  left_join(
+    SITES %>% dplyr::select(site, plot, site.quality),
+    by = c("site", "plot")
+  ) %>%
+  
+  left_join(DAT.floodgroup, by = c("site", "plot", "siteplot"))
+
+
+M.y <- as.matrix(M.y[ , -(1:3)])
+rownames(M.y) <- SiteLookup$siteplot
+
+```
+
+
+## Preferred model
+
+### Load model object and get MCMC samples
+
+```{r}
+
+ModelPath <- here::here("models", "fitted", "model_chosen_mcmc.RData")
+
+if (!file.exists(ModelPath)) 
+  stop("Missing file with MCMC samples for chosen model")
+
+samples <- load_from(ModelPath)
+
+# Discard log-likelihood params
+ii <- str_detect(colnames(samples), "loglik")
+samples <- samples[, !ii]
+
+ii <- str_detect(colnames(samples), "loglik")
+post.samples <- as.matrix(samples[, !ii])
+
+rm(samples)
+gc()
+
+```
+
+### Retrieve posterior samples for mean stem counts
+
+```{r}
+
+# This assumes mu.stems params are ordered by plot (first index) within size 
+# class (second index)
+# i.e. mu.stems[plot1, sz1], mu.stems[plot2, sz1] ... mu.stems[plot66, sz11]
+ii <- str_detect(colnames(post.samples), "mu.stems")
+
+nr <- nrow(post.samples)
+dat.mu <- array(NA, dim = c(66, 11, nr))
+for (r in 1:nr) dat.mu[,,r] <- post.samples[r,ii]
+
+# Group size classes as per model: 1,2,3,4,5-8,9-11
+for (r in 1:nr) {
+  dat.mu[,5,r] <- rowSums(dat.mu[,5:8,r])
+  dat.mu[,6,r] <- rowSums(dat.mu[,9:11,r])
+}
+dat.mu <- dat.mu[,1:6,]
+
+# Median posterior stem densities for actual sites
+dat.actual <- apply(dat.mu, MARGIN = 1:2, median) %>%
+  as.data.frame()
+
+colnames(dat.actual) <- c("<10cm", "<20cm", "<30cm", "<40cm", "<80cm", ">80cm")
+
+```
+
+
+## Individual species GAMS
+
+### Plotting function
+
+The function takes data for a single species and fits a GAM smooth for each stem size class.
+
+```{r}
+
+fn_plot <- function(spindex) {
+  y <- M.y[, spindex]
+
+  dat.gg <- cbind(dat.actual, y = M.y[, spindex]) %>%
+    tidyr::pivot_longer(-y, names_to = "sizeclass") %>%
+    mutate(present = (y == 1))
+  
+  ggplot(data = dat.gg, aes(x = value, y = y)) +
+    geom_point(aes(shape = present), colour = "grey60", show.legend = FALSE) +
+    
+    geom_smooth(method = "gam", formula = y ~ s(x, k=4, bs="ts"), 
+                method.args = list(family = binomial(), method = "REML", select=TRUE),
+                alpha = 0.4) +
+    
+    geom_smooth(method = "glm", formula = y ~ x,
+                method.args = list(family = binomial()),
+                se = FALSE, linetype = "dashed") +
+    
+    scale_y_continuous(limits = c(0,1)) +
+    scale_shape_manual(values = c(1, 16), drop=FALSE) +
+    
+    labs(title = SpeciesSubset$workingname[spindex]) +
+    
+    facet_wrap(~ sizeclass, scales = "free_x")
+}
+
+```
+
+
+### Graph each species
+
+```{r echo=TRUE}
+
+Nspp <- nrow(SpeciesSubset)
+
+for (i in seq(1, Nspp, 4)) {
+  ggs <- lapply(i:min(i+3, Nspp), fn_plot)
+  
+  gg <- patchwork::wrap_plots(ggs, ncol = 2)
+  
+  print(gg)
+}
+
+```
+
+
+
