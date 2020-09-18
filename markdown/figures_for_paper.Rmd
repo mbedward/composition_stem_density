@@ -269,6 +269,9 @@ if (REFIT_MODELS || !file.exists(ModelPath)) {
 
 Graph the sites and plots in ordination (latent variable) space.
 
+
+### Ordination graph
+
 ```{r}
 
 ii <- str_detect(colnames(samples), "lvs\\[")
@@ -420,7 +423,8 @@ if (REFIT_MODELS || !file.exists(ModelPath)) {
   
 ```
 
-Graph the sites and plots in ordination (latent variable) space.
+
+### Ordination graph
 
 ```{r}
 
@@ -453,6 +457,264 @@ gg <- ggplot(data = dat.medians.flood, aes(x = lv1, y = lv2, colour = floodgroup
   labs(x = "Latent variable 1", y = "Latent variable 2")
 
 gg_pdf(gg, filename = "model_floodgroup_ordination.pdf", size = pagesize("A4"))
+
+print(gg)
+
+```
+
+## Latent variables plus stem density
+
+This is the preferred model (see below) with the flood group predictor removed.
+
+### JAGS model code
+
+```{r}
+
+stemsmodel.code <- "model {
+  # Model mean stem count by size class within each plot
+  # Counts are treated as negative binomial - implemented as
+  # Poisson with Gamma-distributed mean
+  for (i in 1:length(nstems)) {
+    nstems[i] ~ dpois(mu.stems[stemplot[i], sz[i]] * h[i])
+    h[i] ~ dgamma(theta[sz[i]], theta[sz[i]])
+  }
+
+  # Priors for stem count model
+  for (sz in 1:11) {
+    # Estimate dispersion independently for each size class
+    theta[sz] ~ dexp(1)
+
+    # Overall mean stems (log scale) for each size class
+    logmu.size[sz] ~ dnorm(0, 5)
+
+    sd.size[sz] ~ dexp(1)
+    tau.size[sz] <- pow(sd.size[sz], -2)
+    
+    for (i in 1:66) {
+      logmu.stems[i, sz] ~ dnorm(logmu.size[sz], tau.size[sz])
+      mu.stems[i, sz] <- exp(logmu.stems[i, sz])
+    }
+  }
+  
+  # Aggregate modelled stem counts for field size classes into
+  # the broader size classes to which species will be related
+  for (i in 1:nplots) {
+    for (k in 1:nsizeclasses) {
+      # MinSize and MaxSize are the start and end indices of field
+      # size classes for each aggregated size class
+      X.stems[i, k] <- sum(mu.stems[i, (MinSize[k]):(MaxSize[k])])
+    }
+  }
+  
+  # Model species occurrence
+  for(i in 1:nplots) {
+    for(j in 1:nspecies) { 
+      eta[i,j] <- inprod(lv.coefs[j,2:(num.lv+1)],lvs[i,]) + 
+        siteplot.effect[i] + 
+        inprod(stem.coefs[j,], X.stems[i,])
+    
+      Z[i,j] ~ dnorm(lv.coefs[j,1] + eta[i,j], 1)
+      y[i,j] ~ dbern(step(Z[i,j]))
+
+      loglik[(i-1)*(nspecies)+j] <- y[i,j] * log(phi(lv.coefs[j,1] + eta[i,j])) + 
+                                 (1 - y[i,j])*log(1 - phi(lv.coefs[j,1] + eta[i,j]))
+    }
+  }
+  
+  ## Latent variables ##
+  for(i in 1:nplots) { for(k in 1:num.lv) { lvs[i,k] ~ dnorm(0,1) } } 
+  
+  ## Process level and priors ##
+  for(j in 1:nspecies) { lv.coefs[j,1] ~ dnorm(0,0.1) } ## Separate species intercepts
+  
+  
+  ## Nested site-plot random effect
+  for(i in 1:nplots) { 
+    siteplot.effect[i] ~ dnorm(site.effect[site[i]], pow(siteplot.sigma, -2)) 
+  }
+  for (i in 1:nsites) {
+    site.effect[i] ~ dnorm(0, pow(site.sigma, -2))
+  }
+  site.sigma ~ dexp(1)
+  siteplot.sigma ~ dexp(2) # Weakly constrain site-plot sigma relative to site sigma
+  
+  
+  ## Constraints on latent variables for rotation invariance
+  ## (based on scheme used in BORAL)
+  for(i in 1:(num.lv-1)) { 
+    for(j in (i+2):(num.lv+1)) {
+      # Constraints to 0 on upper diagonal
+      lv.coefs[i,j] <- 0 
+    } 
+  }
+  
+  for(i in 1:num.lv) { 
+     # Sign constraints on diagonal elements
+    lv.coefs[i,i+1] ~ dnorm(0,0.1)I(0,) 
+  }
+  
+  for(i in 2:num.lv) { 
+    for(j in 2:i) { 
+      # Free lower diagonals
+      lv.coefs[i,j] ~ dnorm(0,0.1) 
+    } 
+  }
+  
+  for(i in (num.lv+1):nspecies) { 
+    for(j in 2:(num.lv+1)) { 
+      # All other elements
+      lv.coefs[i,j] ~ dnorm(0,0.1)
+    } 
+  }
+  
+  # species coefficients on stem density
+  # drawn from Laplace priors with variance equal to that of 
+  # the boral default priors (10).
+
+  laplace.scale <- sqrt(2 / 10)
+  for(j in 1:nspecies) { 
+    for (ksize in 1:nsizeclasses) {
+      stem.coefs[j,ksize] ~ ddexp(0, laplace.scale)
+    }
+  }
+}"
+
+```
+
+
+### Format data for the model
+
+```{r}
+
+# Observed stem densities from pre- and post-thinning surveys. 
+# Note - these are the same data as in the file `stems_complete.RData` 
+# in the related `red_gum_thinning/stem_densities` project.
+
+path <- here("data", "stems_observed_density.RData")
+
+DAT.stems.observed <- load_from(path) %>%
+  # Subset to control and pre-thinning plot data
+  dplyr::filter(survey %in% c("control", "pre.thinning")) %>%
+  
+  arrange(site, plot, subplot) %>%
+  
+  dplyr::select(site, plot, !!(SIZES$sizeclass)) %>%
+  
+  tidyr::pivot_longer(-c(site, plot), names_to = "sizeclass", values_to = "nstems") %>%
+
+  dplyr::filter(!is.na(nstems)) %>%
+  
+  mutate(plotindex = 3*(site-1) + plot,
+         sz = match(sizeclass, SIZES$sizeclass)) %>%
+  
+  dplyr::select(plot = plotindex, sz, nstems)
+
+
+# Aggregated size classes for modelling
+
+SizeClasses <- c("less10cm", "from10to20cm", "from20to30cm",
+                 "from30to40cm", "from40to80cm", "from80cm")
+
+FieldToModelSizeClass <- list(
+  1, 2, 3, 4, 5:8, 9:11
+)
+
+# JAGS will not work with the lookup list FieldToModelSizeClass
+# directly, so we create vector versions
+MinSize <- sapply(FieldToModelSizeClass, min)
+MaxSize <- sapply(FieldToModelSizeClass, max)
+
+stemsmodel.data <- list(
+  y = M.y,
+  nsites = max(SiteLookup$site),
+  nplots = nrow(M.y),
+  nspecies = ncol(M.y),
+  
+  # site index for each floristic plot
+  site = SiteLookup$site,
+  
+  num.lv = 2,
+  
+  # stem counts
+  stemplot = DAT.stems.observed$plot,
+  sz = DAT.stems.observed$sz,
+  nstems = DAT.stems.observed$nstems,
+  nsizeclasses = length(SizeClasses),
+  MinSize = MinSize,
+  MaxSize = MaxSize
+)
+
+```
+
+
+### Compile and run the model
+
+```{r}
+
+ModelPath <- here::here("models", "fitted", "model_stems.RData")
+
+if (REFIT_MODELS || !file.exists(ModelPath)) {
+  modelfit <- R2jags::jags(
+    data = stemsmodel.data, 
+    inits = list(list(Z = fn_Zinit(M.y))), 
+    parameters.to.save = c("loglik",
+                           "lvs", "lv.coefs", 
+                           "mu.stems",
+                           "siteplot.effect",
+                           "siteplot.sigma",
+                           "site.sigma",
+                           "stem.coefs"), 
+    model.file = textConnection(stemsmodel.code),
+    n.chains = 1, 
+    n.iter = 210000, 
+    n.burnin = 10000, 
+    n.thin = 20
+  )
+  
+  
+  samples <- coda::mcmc(modelfit$BUGSoutput$sims.matrix, start = 1, thin = 1)
+  save(samples, file = ModelPath)
+  
+} else {
+  samples <- load_from(ModelPath)
+}
+  
+```
+
+
+### Ordination graph
+
+```{r}
+
+ii <- str_detect(colnames(samples), "lvs\\[")
+x <- apply(as.matrix(samples)[, ii], MARGIN = 2, median)
+
+dat.medians.flood <- as.data.frame(x) %>%
+  rename(median = x) %>%
+  
+  mutate(indices = str_extract(rownames(.), "\\d+\\,\\d")) %>%
+  tidyr::separate(indices, into = c("plotindex", "lv"), sep = ",", convert = TRUE) %>%
+  mutate(site = 1 + ((plotindex - 1) %/% 3),
+         plot = 1 + ((plotindex - 1) %% 3)) %>%
+  
+  tidyr::pivot_wider(names_from = lv, names_prefix = "lv",
+                     values_from = median) %>%
+  
+  left_join(DAT.floodgroup, by = c("site", "plot"))
+  
+
+gg <- ggplot(data = dat.medians.flood, aes(x = lv1, y = lv2, colour = floodgroup)) +
+  geom_point(size = 3, alpha = 0.4) +
+  geom_text_repel(aes(label = site)) +
+  
+  scale_colour_discrete("Flood\ngroup") +
+  
+  lims(x = c(-1, 2), y = c(-2, 1)) +
+  coord_equal() +
+  
+  labs(x = "Latent variable 1", y = "Latent variable 2")
+
+gg_pdf(gg, filename = "model_stems_ordination.pdf", size = pagesize("A4"))
 
 print(gg)
 
