@@ -204,16 +204,55 @@ colnames(dat.actual) <- c("<10cm", "<20cm", "<30cm", "<40cm", "<80cm", ">80cm")
 
 ### Plotting function
 
-The function takes data for a single species and fits a GAM smooth for each stem size class.
+The function takes data for a single species and fits a GAM smooth for each stem size class. 
+
+It also fits a trend line (shown in red on the graphs) derived from the posterior distribution of the preferred model. This is done for each species by:
+
+  1. Get the MCMC samples for the species intercept and the stem density coefficients.
+  
+  2. Calculate a linear predictor value based on the mean stem density values for each size class individually: lp = b0 + b1[sizeclass] * mean.density
+  
+  3. Calculate median value of the linear predictor for each size class and transform to a probability using probit link.
+  
+The intention is to show the marginal effect of each stem size class on probability of occurrence.
+
 
 ```{r}
 
 fn_plot <- function(spindex) {
   y <- M.y[, spindex]
-
-  dat.gg <- cbind(dat.actual, y = M.y[, spindex]) %>%
-    tidyr::pivot_longer(-y, names_to = "sizeclass") %>%
-    mutate(present = (y == 1))
+  
+  # species intercepts
+  ptn <- sprintf("lv.coefs\\[%d,1\\]", spindex)
+  ii <- str_detect(colnames(post.samples), ptn)
+  b0 <- post.samples[, ii]
+  
+  # species coefficients on stem density
+  ptn <- sprintf("stem.coefs\\[%d,", spindex)
+  ii <- str_detect(colnames(post.samples), ptn)
+  b1 <- post.samples[, ii]
+  
+  X <- as.matrix(dat.actual)
+  
+  # GLM prediction based only on intercept and stem density
+  pfit <- lapply(1:ncol(dat.actual), function(k) {
+    lp <- b0 + tcrossprod(b1[,k], X[,k])
+    lp <- apply(lp, MARGIN = 2, quantile, probs = c(0.25, 0.5, 0.75))
+    lp <- t(lp)
+    colnames(lp) <- c("lwr", "mid", "upr")
+    
+    out <- data.frame(sizeclass = colnames(X)[k], 
+                      plotindex = 1:nrow(X))
+    
+    cbind(out, pnorm(lp))
+  })
+  
+  pfit <- do.call(rbind, pfit)
+  
+  dat.gg <- cbind(dat.actual, plotindex = 1:nrow(M.y), y = M.y[, spindex]) %>%
+    tidyr::pivot_longer(-c(plotindex, y), names_to = "sizeclass") %>%
+    mutate(present = (y == 1)) %>%
+    left_join(pfit, by = c("plotindex", "sizeclass"))
   
   ggplot(data = dat.gg, aes(x = value, y = y)) +
     geom_point(aes(shape = present), colour = "grey60", show.legend = FALSE) +
@@ -225,6 +264,11 @@ fn_plot <- function(spindex) {
     geom_smooth(method = "glm", formula = y ~ x,
                 method.args = list(family = binomial()),
                 se = FALSE, linetype = "dashed") +
+    
+    geom_ribbon(aes(ymin = lwr, ymax = upr), 
+                fill = "red", alpha = 0.2) +
+    
+    geom_line(aes(y = mid), colour = "red") +
     
     scale_y_continuous(limits = c(0,1)) +
     scale_shape_manual(values = c(1, 16), drop=FALSE) +
